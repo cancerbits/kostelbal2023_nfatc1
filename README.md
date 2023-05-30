@@ -26,6 +26,6 @@ Paths in the `config.yaml` file starting with "/path/to/" will have to be set.
 
 ## Links
 
-**Paper:** [link to Blood](https://)
+**Paper:** [*Blood* blood.2022018303](https://doi.org/10.1182/blood.2022018303)
 
-**Data files:** Raw and preprocessed data can be found at [link to data](https://).
+**Data files:** Raw data files will be available at [The European Genome-phenome Archive (EGA)](https://ega-archive.org).

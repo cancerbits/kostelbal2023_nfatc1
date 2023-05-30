@@ -1,10 +1,10 @@
-project_name: nfatc1
-project_docker: cancerbits/nfatc1
+project_name: nfatc1  # do not change
+project_docker: cancerbits/nfatc1  # do not change
 project_root_host: /path/to/project/nfatc1
-data_root_host: /path/to/data/nfatc1
+data_root_host: /path/to/data/nfatc1  # this dir will be scanned recursively for 10x Cell Ranger output
 out_root_host: /path/to/output/nfatc1
 azimuth_ref_human_pbmc: /path/to/resources/azimuth/ref_human_pbmc
 enrichr_lib: /path/to/resources/genesets/enrichr_lib_221215
-project_root: /home/rstudio
-data_root: /home/rstudio/mnt_data
-out_root: /home/rstudio/mnt_out
+project_root: /home/rstudio  # do not change
+data_root: /home/rstudio/mnt_data  # do not change
+out_root: /home/rstudio/mnt_out  # do not change
