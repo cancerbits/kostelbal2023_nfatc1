@@ -1,4 +1,4 @@
-# Code repository for the analysis of single-cell RNA-seq data presented in Kostel Bal et al., Blood, 2023
+# Code repository for the analysis of single-cell RNA-seq data presented in Köstel Bal et al., Blood, 2023
 
 Christoph Hafemeister and Florian Halbritter
 
@@ -20,7 +20,7 @@ delayed, but not lost activation responses. Indeed, we observed increased 13C-la
 
 ## Reproducing the results
 
-The file `R/knit.R` calls all `Rmd/*.Rmd` files in order to reproduce the analysis.
+The file `R/knit.R` calls all `Rmd/*.rmd` files in order to reproduce the analysis.
 
 Paths in the `config.yaml` file starting with "/path/to/" will have to be set.
 
