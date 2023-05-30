@@ -1,8 +1,10 @@
-project_name: example_project_name
-project_docker: cancerbits/dockr:example_project_name
-project_root_host: /path/to/project
+project_name: nfatc1
+project_docker: cancerbits/nfatc1
+project_root_host: /path/to/project/nfatc1
+data_root_host: /path/to/data/nfatc1
+out_root_host: /path/to/output/nfatc1
+azimuth_ref_human_pbmc: /path/to/resources/azimuth/ref_human_pbmc
+enrichr_lib: /path/to/resources/genesets/enrichr_lib_221215
 project_root: /home/rstudio
-data_root_host: /path/to/data/example_project
 data_root: /home/rstudio/mnt_data
-out_root_host: /path/to/output/example_project
 out_root: /home/rstudio/mnt_out

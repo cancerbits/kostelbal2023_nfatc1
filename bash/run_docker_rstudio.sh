@@ -21,4 +21,6 @@ docker run -d --rm \
   --volume=${CONF_project_root_host}:${CONF_project_root} \
   --volume=${CONF_data_root_host}:${CONF_data_root} \
   --volume=${CONF_out_root_host}:${CONF_out_root} \
+  --volume=${CONF_enrichr_lib}:${CONF_enrichr_lib} \
+  --volume=${CONF_azimuth_ref_human_pbmc}:${CONF_azimuth_ref_human_pbmc} \
   ${CONF_project_docker}

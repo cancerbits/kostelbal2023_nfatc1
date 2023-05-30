@@ -1,0 +1,328 @@
+---
+title: 'B cell analysis'
+author: 'Christoph Hafemeister'
+date: '`r format(Sys.time(), "%B %d, %Y %H:%M:%S %Z")`'
+output:
+  html_document:
+    toc: TRUE
+    toc_depth: 3
+    toc_float: TRUE
+    code_folding: "hide"
+params:
+  config_file: "config.yaml"
+---
+
+# Setup
+
+```{r}
+# load project-specific parameters
+config <- yaml::read_yaml(params$config_file)
+
+suppressPackageStartupMessages({
+  library('Matrix')
+  library('dplyr')
+  library('Seurat')
+  library('sctransform')
+  library('reshape2')
+  library('ggplot2')
+  library('patchwork')
+  library('ggrepel')
+  source(file.path(config$project_root, 'R', 'utils.r'))
+})
+
+#future::plan(strategy = "multiprocess", workers = 1)
+#options(future.globals.maxSize = 8 * 1024 ^ 3)
+#options(future.fork.enable = TRUE)
+
+knitr::opts_chunk$set(comment = NA, fig.width = 5, fig.height = 3.5, out.width = '60%',
+                      warning = TRUE, error = TRUE, echo = TRUE, message = TRUE,
+                      dpi = 100)
+options(dplyr.summarise.inform = FALSE)
+options(tibble.width = Inf)
+options(DT.options = list(paging = TRUE, searching = TRUE, autoWidth = TRUE))
+options(ggrepel.max.overlaps = Inf)
+
+old <- theme_set(theme_bw(base_size = 11))
+set.seed(8569205)
+start_time <- proc.time()['elapsed']
+```
+
+# Read data and prep
+
+```{r}
+s <- readRDS(file = file.path(config$out_root, '02_integration_NFATc1_s.rds'))
+md <- readRDS(file = file.path(config$out_root, '03_integrated_NFATc1_annotated_meta_data.rds'))
+#az_umap <- readRDS(file = file.path(config$out_root, '03_integrated_NFATc1_annotated_az_umap.rds'))
+s <- AddMetaData(s, md)
+
+s$celltype <- mutate(s@meta.data, celltype = case_when(
+  stringr::str_starts(az.annotation, 'B ') ~ 'B cells',
+  stringr::str_starts(az.annotation, 'NK') ~ 'NK cells',
+  stringr::str_starts(az.annotation, 'CD4 ') ~ 'CD4 T cells',
+  stringr::str_starts(az.annotation, 'CD8 ') ~ 'CD8 T cells',
+  TRUE ~ az.annotation
+)) %>% pull(celltype)
+```
+
+Change sample names
+```{r}
+new_name <- function(old_name) {
+  old_name <- stringr::str_replace(old_name, pattern = '_[A-Z0-9]+$', replacement = '')
+  ret <- sapply(old_name, function(on) {
+    if (grepl(pattern = '^KB[1234]', x = on)) {
+      nn <- stringr::str_replace(on, pattern = 'KB(?=[1234])', replacement = 'ND')
+    } else {
+      n <- as.numeric(gsub('KB', '', on))
+      nn <- sprintf('P%d', n - 6)
+    }
+    return(nn)
+  })
+  ret
+}
+md$orig.ident <- new_name(md$orig.ident)
+s@meta.data$orig.ident <- new_name(s@meta.data$orig.ident)
+```
+
+Set up colors
+```{r}
+#genotype_cols <- c(hcl.colors(n = 4, palette = 'Blues2')[2], hcl.colors(n = 4, palette = 'Reds2')[2])
+#genotype_cols <- c('gray45', 'deeppink')
+genotype_cols <- c('#263f82', '#c9443b')
+genotype_order <- c('WT', 'NFATc1 mutant')
+names(genotype_cols) <- genotype_order
+s$genotype <- factor(as.character(droplevels(s$genotype)), levels = rev(genotype_order))
+```
+
+# Clonotypes
+
+Clonality based on cells with exactly one H and one (K or L) chain
+```{r}
+cl_dat <- readRDS(file = file.path(config$out_root, '04_clonotypes_NFATc1.rds'))
+cl_dat$clono_dat$sample_id <- new_name(cl_dat$clono_dat$sample_id)
+df <- arrange(cl_dat$clono_dat, sample_id, barcode, chain) %>%
+  group_by(sample_id, barcode, chain) %>%
+  mutate(chain_n = n(), chain_cdr3 = paste(chain, cdr3, sep=':'), 
+         isH = stringr::str_starts(chain, 'IGH'),
+         isKorL = stringr::str_starts(chain, 'IG[KL]')) %>%
+  ungroup() %>%
+  filter(chain_n == 1, isH | isKorL) %>%
+  group_by(sample_id, barcode) %>%
+  summarise(bc_n = n(), nH = sum(isH), nKL = sum(isKorL), clonotype = paste(chain_cdr3, collapse = ';'), .groups = 'drop') %>%
+  filter(nH == 1, nKL == 1) %>%
+  group_by(sample_id) %>%
+  summarise(cells = n(), clonotypes = length(unique(clonotype)), clonality = 1 - norm_entropy(clonotype))
+df$genotype <- c('NFATc1 mutant', 'WT')[grepl('^ND', df$sample_id ) + 1]
+df$genotype <- factor(df$genotype, levels = c('WT', 'NFATc1 mutant'))
+
+print(df)
+
+p1 <- ggplot(df, aes(sample_id, clonality, fill = genotype)) + 
+  geom_bar(stat = 'identity') + 
+  scale_fill_manual(values = genotype_cols) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  xlab('Sample') + ylab('Clonality') +
+  theme(panel.grid.major.y = element_line(rel(0.5), color="grey75")) +
+  theme(legend.position = "none")
+show(p1)
+```
+
+Clonality based on cells with exactly one H and one K chain
+```{r}
+cl_dat <- readRDS(file = file.path(config$out_root, '04_clonotypes_NFATc1.rds'))
+cl_dat$clono_dat$sample_id <- new_name(cl_dat$clono_dat$sample_id)
+df <- arrange(cl_dat$clono_dat, sample_id, barcode, chain) %>%
+  group_by(sample_id, barcode, chain) %>%
+  mutate(chain_n = n(), chain_cdr3 = paste(chain, cdr3, sep=':'), 
+         isH = stringr::str_starts(chain, 'IGH'),
+         isKorL = stringr::str_starts(chain, 'IG[K]')) %>%
+  ungroup() %>%
+  filter(chain_n == 1, isH | isKorL) %>%
+  group_by(sample_id, barcode) %>%
+  summarise(bc_n = n(), nH = sum(isH), nKL = sum(isKorL), clonotype = paste(chain_cdr3, collapse = ';'), .groups = 'drop') %>%
+  filter(nH == 1, nKL == 1) %>%
+  group_by(sample_id) %>%
+  summarise(cells = n(), clonotypes = length(unique(clonotype)), clonality = 1 - norm_entropy(clonotype))
+df$genotype <- c('NFATc1 mutant', 'WT')[grepl('^ND', df$sample_id ) + 1]
+df$genotype <- factor(df$genotype, levels = c('WT', 'NFATc1 mutant'))
+
+print(df)
+
+p1 <- ggplot(df, aes(sample_id, clonality, fill = genotype)) + 
+  geom_bar(stat = 'identity') + 
+  scale_fill_manual(values = genotype_cols) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  xlab('Sample') + ylab('Clonality') +
+  theme(panel.grid.major.y = element_line(rel(0.5), color="grey75")) +
+  theme(legend.position = "none")
+show(p1)
+```
+
+Clonality based on cells with exactly one H and one L chain
+```{r}
+cl_dat <- readRDS(file = file.path(config$out_root, '04_clonotypes_NFATc1.rds'))
+cl_dat$clono_dat$sample_id <- new_name(cl_dat$clono_dat$sample_id)
+df <- arrange(cl_dat$clono_dat, sample_id, barcode, chain) %>%
+  group_by(sample_id, barcode, chain) %>%
+  mutate(chain_n = n(), chain_cdr3 = paste(chain, cdr3, sep=':'), 
+         isH = stringr::str_starts(chain, 'IGH'),
+         isKorL = stringr::str_starts(chain, 'IG[L]')) %>%
+  ungroup() %>%
+  filter(chain_n == 1, isH | isKorL) %>%
+  group_by(sample_id, barcode) %>%
+  summarise(bc_n = n(), nH = sum(isH), nKL = sum(isKorL), clonotype = paste(chain_cdr3, collapse = ';'), .groups = 'drop') %>%
+  filter(nH == 1, nKL == 1) %>%
+  group_by(sample_id) %>%
+  summarise(cells = n(), clonotypes = length(unique(clonotype)), clonality = 1 - norm_entropy(clonotype))
+df$genotype <- c('NFATc1 mutant', 'WT')[grepl('^ND', df$sample_id ) + 1]
+df$genotype <- factor(df$genotype, levels = c('WT', 'NFATc1 mutant'))
+
+print(df)
+
+p1 <- ggplot(df, aes(sample_id, clonality, fill = genotype)) + 
+  geom_bar(stat = 'identity') + 
+  scale_fill_manual(values = genotype_cols) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  xlab('Sample') + ylab('Clonality') +
+  theme(panel.grid.major.y = element_line(rel(0.5), color="grey75")) +
+  theme(legend.position = "none")
+show(p1)
+```
+
+# DE between mutant and wildtype
+
+Show number of cells per sample and group
+```{r}
+print(table(s$orig.ident, s$genotype))
+print(table(s$orig.ident, s$celltype))
+```
+
+Generate sample-level meta data
+```{r}
+sample_md <- group_by(s@meta.data, orig.ident) %>%
+  summarise(genotype = genotype[1], n = n(), count_sum = sum(nCount_RNA))
+```
+
+DE test
+```{r}
+sel <- s$celltype == 'B cells'
+counts <- s$RNA@counts[, sel]
+de_res <- run_edgeR(counts = counts, 
+                    group_labels = s$genotype[sel], 
+                    sample_labels = s$orig.ident[sel])
+```
+
+Show the significant DE results here (FDR below 0.05)
+```{r}
+filter(de_res, FDR < 0.05) %>%
+  select(gene, logFC, logCPM, PValue, FDR) %>%
+  DT::datatable(rownames = FALSE) %>%
+  DT::formatSignif(columns = c('logFC', 'logCPM', 'PValue', 'FDR'), digits = 3)
+```
+
+Show average expression per sample per cell type for the top markers
+```{r, fig.width=3, out.width='40%', fig.height=4}
+goi <- filter(de_res, FDR < 0.1) %>% pull(gene)
+df <- melt(t(as.matrix(s$RNA@counts[goi, ])), 
+           varnames = c('cell', 'gene'), 
+           value.name = 'count') %>% 
+  left_join(tibble::rownames_to_column(s@meta.data, var = 'cell'), by = 'cell') %>%
+  group_by(genotype, orig.ident, celltype, gene) %>%
+  summarise(logCPM = log(sum(count) / sum(nCount_RNA) * 1e6 + 1)) %>%
+  filter(celltype == 'B cells') %>%
+  group_by(gene) %>% 
+  mutate(expr_scaled = scales::oob_squish(x = scale(logCPM)[, 1], range = c(-3, 3)))
+levels(df$genotype) <- c('M', 'WT')[grepl('WT', levels(df$genotype)) + 1]
+
+mat <- acast(df, gene ~ celltype + orig.ident, value.var = 'expr_scaled')
+tmp <- hclust(dist(mat, method = 'manhattan'), method = 'ward.D2')
+df$gene <- factor(df$gene, levels = rownames(mat)[tmp$order])
+
+p1 <- ggplot(df, aes(orig.ident, gene, fill = expr_scaled)) +
+  geom_tile(colour = "gray66") +
+  facet_grid(. ~ paste(celltype, genotype), scales = 'free', space = 'free') +
+  #scale_fill_gradient2(low = '#4d9221', mid = 'white', high = '#c51b7d', midpoint = 0,
+  #                     name = "Expression\n[rescaled]") +
+  scale_fill_gradient2(low = '#282e58', mid = 'white', high = '#b0403d', midpoint = 0,
+                       name = "Expression\n[rescaled]") +
+  theme(panel.spacing = unit(0, "lines")) +
+  labs(x = NULL, y = NULL) + 
+  scale_x_discrete(expand = c(0, 0)) + 
+  scale_y_discrete(expand = c(0, 0)) + 
+  theme(axis.text.x=element_blank()) + 
+  theme(axis.text.y=element_text(size=rel(0.8))) + 
+  theme(strip.text.x.top = element_text(angle = 90, hjust = 0)) +
+  theme(legend.position = "bottom", axis.ticks = element_blank()) +
+  theme(legend.title = element_text(size=rel(0.8)), legend.text = element_text(size=rel(0.8)))
+show(p1)
+```
+
+Save previous plot as pdf
+```{r}
+ggsave(filename = file.path(config$out_root, '07_B_cell_DE_heatmap.pdf'), 
+       plot = p1, width = 3, height = 3.5)
+```
+
+
+# GSEA after DE
+
+Define and download pathways (genesets) libraries
+```{r}
+genesets <- c('Reactome_2016', 'MSigDB_Hallmark_2020', 'Panther_2016')
+pathways <- lapply(genesets, function(x) hypeR::enrichr_gsets(genesets = x)$list())
+names(pathways) <- genesets
+pathways <- unlist(pathways, recursive = FALSE)
+```
+
+
+## {.tabset}
+
+Enrichment analysis
+
+### DE genes higher in wildtype
+```{r}
+hyper_res <- de_res %>%
+  mutate(is_de = FDR < 0.1 & logFC > 0) %>%
+  summarise(run_hyper(genes = gene[is_de], background = gene, pathways = pathways)) %>% 
+  rename(pathway = label, de_genes = signature) %>%
+  ungroup() %>%
+  mutate(fdr = p.adjust(pval, method = 'fdr')) %>%
+  #filter(fdr <= 0.1) %>%
+  arrange(pval)
+
+select(hyper_res, pathway, pval, fdr, de_genes, geneset, overlap, hits) %>%
+  slice_head(n = 20) %>%
+  DT::datatable(rownames = FALSE, caption = 'DE in B cells, higher in wildtype') %>%
+  DT::formatSignif(columns = c('fdr'), digits = 3)
+```
+
+### DE genes higher in mutant
+```{r}
+hyper_res <- de_res %>%
+  mutate(is_de = FDR < 0.1 & logFC < 0) %>%
+  summarise(run_hyper(genes = gene[is_de], background = gene, pathways = pathways)) %>% 
+  rename(pathway = label, de_genes = signature) %>%
+  ungroup() %>%
+  mutate(fdr = p.adjust(pval, method = 'fdr')) %>%
+  #filter(fdr <= 0.1) %>%
+  arrange(pval)
+
+select(hyper_res, pathway, pval, fdr, de_genes, geneset, overlap, hits) %>%
+  slice_head(n = 20) %>%
+  DT::datatable(rownames = FALSE, caption = 'DE in B cells, higher in mutant') %>%
+  DT::formatSignif(columns = c('fdr'), digits = 3)
+```
+
+
+
+
+# Runtime and session info
+
+Runtime: `r time_diff(start_time)`
+
+Session Info
+```{r}
+sessionInfo()
+```

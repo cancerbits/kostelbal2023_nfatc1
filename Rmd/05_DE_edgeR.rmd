@@ -1,0 +1,677 @@
+---
+title: 'Differential expression analysis using edgeR'
+author: 'Christoph Hafemeister'
+date: '`r format(Sys.time(), "%B %d, %Y %H:%M:%S %Z")`'
+output:
+  html_document:
+    toc: TRUE
+    toc_depth: 3
+    toc_float: TRUE
+    code_folding: "hide"
+params:
+  config_file: "config.yaml"
+---
+
+```{r}
+# load project-specific parameters
+config <- yaml::read_yaml(params$config_file)
+
+suppressPackageStartupMessages({
+  library('Matrix')
+  library('dplyr')
+  library('Seurat')
+  library('sctransform')
+  library('reshape2')
+  library('ggplot2')
+  library('patchwork')
+  library('ggrepel')
+  source(file.path(config$project_root, 'R', 'utils.r'))
+})
+
+#future::plan(strategy = "multiprocess", workers = 1)
+#options(future.globals.maxSize = 8 * 1024 ^ 3)
+#options(future.fork.enable = TRUE)
+
+knitr::opts_chunk$set(comment = NA, fig.width = 5, fig.height = 3.5, out.width = '60%',
+                      warning = TRUE, error = TRUE, echo = TRUE, message = TRUE,
+                      dpi = 100)
+options(dplyr.summarise.inform = FALSE)
+options(tibble.width = Inf)
+options(DT.options = list(paging = TRUE, searching = TRUE, autoWidth = TRUE))
+options(ggrepel.max.overlaps = Inf)
+
+old <- theme_set(theme_bw(base_size = 11))
+set.seed(8569205)
+start_time <- proc.time()['elapsed']
+```
+
+## Intro
+
+* What are the DE genes between healthy and patients?
+
+## Load data, annotate, subset
+
+```{r}
+s  <- readRDS(file = file.path(config$out_root, '02_integration_NFATc1_s.rds'))
+md <- readRDS(file = file.path(config$out_root, '03_integrated_NFATc1_annotated_meta_data.rds'))
+s <- AddMetaData(s, md)
+
+keep <- s$orig.ident %in% c('KB1_NDBR', 'KB2_NDRJH', 'KB3_PID355', 'KB4_IBD238',  
+                            'KB7_PID1180', 'KB8_PID1185')
+s <- s[, keep]
+s$genotype <- factor(as.character(droplevels(s$genotype)), levels = c("NFATc1 mutant", 'WT'))
+```
+
+Show number of cells per sample and group
+```{r}
+print(table(s$orig.ident, s$genotype))
+```
+
+Generate sample-level meta data
+```{r}
+sample_md <- group_by(s@meta.data, orig.ident) %>%
+  summarise(genotype = genotype[1], n = n(), count_sum = sum(nCount_RNA))
+```
+
+
+
+## DE simple: NFATc1 mutant vs WT
+
+These first set of simple DE analyses combine all mutant samples into one group and all WT samples into another.
+
+### All cell types / clusters combined (pseudo-bulk)
+
+This does not distinguish between changes in expression and changes in cell type composition between samples.
+
+```{r, fig.height=5, fig.width=7, out.width='70%'}
+de_res <- run_edgeR(counts = GetAssayData(s, assay = "RNA", slot = "counts"), 
+                    group_labels = s$genotype, 
+                    sample_labels = s$orig.ident) %>%
+  mutate(pval_clipped = scales::oob_squish_any(x = PValue, range = c(1e-20, Inf)))
+
+top_markers <- filter(de_res, FDR < 0.05) %>%
+    group_by(sign(logFC)) %>% 
+    filter(rank(FDR, ties.method = "first") <= 10) 
+
+p1 <- ggplot(de_res, aes(logFC, -log10(pval_clipped))) + 
+  geom_point(aes(color = FDR < 0.05)) + 
+  geom_point(data = top_markers, color = "deeppink") + 
+  geom_text_repel(data = top_markers, mapping = aes(label = gene)) + 
+  theme(legend.position = "bottom") + 
+  ylab("-log10 of p-value clipped to range [1e-20, 1]") + 
+  xlab("logFC")
+
+show(p1 + plot_annotation(title = 'NFATc1 mutant vs WT (pseudo-bulk); top genes labeled', subtitle = 'negative fold change means higher expression in mutant'))
+```
+
+Show average expression per sample per condition (logCPM scaled per gene)
+```{r, fig.width=6, out.width='60%', fig.height=4.5}
+goi <- rev(unique(top_markers$gene))
+# use the pseudobulk data
+pb_logcounts <- pseudobulk(counts = s$RNA@counts, 
+                        grouping = s$orig.ident, 
+                        transformation = 'logCPM')
+df <- melt(t(pb_logcounts[goi, ]), 
+           varnames = c('orig.ident', 'gene'), 
+           value.name = 'logCPM') %>% 
+  left_join(sample_md, by = 'orig.ident',   ) %>%
+  group_by(genotype, orig.ident, gene) %>%
+  group_by(gene) %>% 
+  mutate(logCPM_scaled = scales::oob_squish(x = scale(logCPM)[, 1], range = c(-3, 3)))
+p1 <- ggplot(df, aes(orig.ident, gene, fill = logCPM_scaled)) +
+  geom_tile(colour = "gray66") +
+  facet_grid(. ~ genotype, scales = "free", space='free') +
+  scale_fill_gradient2(low = '#4d9221', mid = 'white', high = '#c51b7d', midpoint = 0,
+                       name = "Expression [rescaled]") +
+  theme(panel.spacing = unit(0, "lines")) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) + 
+  labs(x = NULL, y = NULL) + 
+  scale_x_discrete(expand = c(0, 0)) + 
+  scale_y_discrete(expand = c(0, 0)) + 
+  theme(legend.position = "top", axis.ticks = element_blank())
+show(p1)
+```
+
+
+Write DE results to file
+```{r}
+# add the mean expression per sample to the results
+tmp <- dcast(df, gene ~ orig.ident, value.var = 'logCPM')
+colnames(tmp)[2:ncol(tmp)] <- paste0('logCPM_', colnames(tmp)[2:ncol(tmp)])
+tmp <- left_join(de_res, tmp, by = 'gene')
+
+filename <- '05_DE_edgeR_pseudobulk_mutant_vs_wildtype.csv'
+message(sprintf('Output file name: %s', filename))
+readr::write_excel_csv2(x = tmp, file = file.path(config$out_root, filename))
+```
+
+Also show the significant DE results here (FDR < 0.05)
+```{r}
+filter(de_res, FDR < 0.05) %>%
+  select(gene, logFC, logCPM, PValue, FDR) %>%
+  DT::datatable(rownames = FALSE) %>%
+  DT::formatSignif(columns = c('logFC', 'logCPM', 'PValue', 'FDR'), digits = 3)
+```
+
+
+### {.tabset}
+
+Enrichment analysis
+
+#### DE genes higher in mutant
+```{r}
+# load the pathways (do this only once)
+pathways <- hypeR::enrichr_gsets(genesets = 'GO_Biological_Process_2021')$list()
+
+# for the genes higher in mutant
+hyper_res <- mutate(de_res, is_de = FDR < 0.05 & logFC < 0) %>%
+  summarise(run_hyper(genes = gene[is_de], background = gene, pathways = pathways)) %>% 
+  rename(pathway = label, de_genes = signature) %>%
+  mutate(fdr = p.adjust(pval, method = 'fdr')) %>%
+  filter(fdr <= 0.1)
+
+select(hyper_res, pathway, fdr, de_genes, geneset, overlap, hits) %>%
+  DT::datatable(rownames = FALSE) %>%
+  DT::formatSignif(columns = c('fdr'), digits = 3)
+
+readr::write_csv2(x = hyper_res, file = file.path(config$out_root, '05_DE_edgeR_pseudobulk_mutant_vs_wildtype_enrich_higher_in_mutant.csv'))
+```
+
+#### DE genes higher in WT
+```{r}
+hyper_res <- mutate(de_res, is_de = FDR < 0.05 & logFC > 0) %>%
+  summarise(run_hyper(genes = gene[is_de], background = gene, pathways = pathways)) %>% 
+  rename(pathway = label, de_genes = signature) %>%
+  mutate(fdr = p.adjust(pval, method = 'fdr')) %>%
+  filter(fdr <= 0.1)
+
+select(hyper_res, pathway, fdr, de_genes, geneset, overlap, hits) %>%
+  DT::datatable(rownames = FALSE) %>%
+  DT::formatSignif(columns = c('fdr'), digits = 3)
+
+readr::write_csv2(x = hyper_res, file = file.path(config$out_root, '05_DE_edgeR_pseudobulk_mutant_vs_wildtype_enrich_higher_in_WT.csv'))
+```
+
+
+
+### Per integration cluster
+
+Perform DE test between mutant and WT per cluster
+
+```{r}
+de <- run_edgeR_split(counts = GetAssayData(s, assay = "RNA", slot = "counts"), 
+                     group_labels = s$genotype, 
+                     sample_labels = s$orig.ident, 
+                     split_factor = s$integration_cluster)
+```
+
+Volcano plots
+```{r, fig.width=12, fig.height=12, out.width='100%'}
+p1 <- edgeR_conserved_plot_volcano(de, facet_var = 'split_level', ncol = 3)
+
+show(p1 + plot_annotation(title = 'NFATc1 mutant vs WT per integration cluster', subtitle = 'negative fold change means higher expression in mutant'))
+```
+
+Show average expression per sample per condition for the top markers (logCPM, scaled per gene)
+```{r, fig.width=8, out.width='80%', fig.height=10}
+goi <- unique(de$top_markers$gene)
+
+df <- melt(t(as.matrix(s$RNA@counts[goi, ])), 
+           varnames = c('cell', 'gene'), 
+           value.name = 'count') %>% 
+  left_join(tibble::rownames_to_column(s@meta.data, var = 'cell'), by = 'cell') %>%
+  group_by(genotype, orig.ident, integration_cluster, gene) %>%
+  summarise(logCPM = log(sum(count) / sum(nCount_RNA) * 1e6 + 1)) %>%
+  group_by(gene) %>% 
+  mutate(expr_scaled = scales::oob_squish(x = scale(logCPM)[, 1], range = c(-3, 3)))
+levels(df$genotype) <- c('M', 'WT')[grepl('WT', levels(df$genotype)) + 1]
+
+mat <- acast(df, gene ~ integration_cluster + orig.ident, value.var = 'expr_scaled')
+tmp <- hclust(dist(mat, method = 'manhattan'), method = 'ward.D2')
+df$gene <- factor(df$gene, levels = rownames(mat)[tmp$order])
+
+p1 <- ggplot(df, aes(orig.ident, gene, fill = expr_scaled)) +
+  geom_tile(colour = "gray66") +
+  facet_grid(. ~ integration_cluster + genotype, scales = 'free', space = 'free') +
+  scale_fill_gradient2(low = '#4d9221', mid = 'white', high = '#c51b7d', midpoint = 0,
+                       name = "Expression [rescaled]") +
+  theme(panel.spacing = unit(0, "lines")) +
+  labs(x = NULL, y = NULL) + 
+  scale_x_discrete(expand = c(0, 0)) + 
+  scale_y_discrete(expand = c(0, 0)) + 
+  theme(axis.text.x=element_blank()) + 
+  theme(axis.text.y=element_text(size=rel(0.8))) + 
+  theme(legend.position = "top", axis.ticks = element_blank())
+show(p1)
+```
+
+Write DE results to file
+```{r}
+# add the mean expression per sample per cluster to the results
+tmp <- melt(t(as.matrix(s$RNA@counts[unique(de$res$gene), ])), 
+           varnames = c('cell', 'gene'), 
+           value.name = 'count') %>% 
+  left_join(tibble::rownames_to_column(s@meta.data, var = 'cell'), by = 'cell') %>%
+  group_by(genotype, orig.ident, integration_cluster, gene) %>%
+  summarise(logCPM = log(sum(count) / sum(nCount_RNA) * 1e6 + 1)) %>%
+  dcast(gene + integration_cluster ~ orig.ident, value.var = 'logCPM')
+
+colnames(tmp)[3:ncol(tmp)] <- paste0('logCPM_', colnames(tmp)[3:ncol(tmp)])
+tmp <- left_join(de$res, tmp, by = c('gene' = 'gene', 'split_level' = 'integration_cluster')) %>% dplyr::rename(integration_cluster = split_level)
+filename <- '05_DE_edgeR_per_cluster_mutant_vs_wildtype.csv'
+message(sprintf('Output file name: %s', filename))
+readr::write_excel_csv2(x = tmp, file = file.path(config$out_root, filename))
+```
+
+Also show the significant DE results here (FDR below 0.05)
+```{r}
+filter(de$res, FDR < 0.05) %>%
+  rename(cluster = split_level) %>%
+  select(cluster, gene, logFC, logCPM, PValue, FDR) %>%
+  DT::datatable(rownames = FALSE) %>%
+  DT::formatSignif(columns = c('logFC', 'logCPM', 'PValue', 'FDR'), digits = 3)
+```
+
+### {.tabset}
+
+Enrichment analysis
+
+#### DE genes higher in mutant
+```{r}
+# for the genes higher in mutant
+hyper_res <- group_by(de$res, split_level) %>%
+  mutate(is_de = FDR < 0.05 & logFC < 0) %>%
+  summarise(run_hyper(genes = gene[is_de], background = gene, pathways = pathways)) %>% 
+  rename(cluster = split_level, pathway = label, de_genes = signature) %>%
+  ungroup() %>%
+  mutate(fdr = p.adjust(pval, method = 'fdr')) %>%
+  filter(fdr <= 0.1)
+
+select(hyper_res, cluster, pathway, fdr, de_genes, geneset, overlap, hits) %>%
+  DT::datatable(rownames = FALSE) %>%
+  DT::formatSignif(columns = c('fdr'), digits = 3)
+
+readr::write_excel_csv2(x = hyper_res, file = file.path(config$out_root, '05_DE_edgeR_per_cluster_mutant_vs_wildtype_enrich_higher_in_mutant.csv'))
+```
+
+#### DE genes higher in WT
+```{r}
+# for the genes higher in mutant
+hyper_res <- group_by(de$res, split_level) %>%
+  mutate(is_de = FDR < 0.05 & logFC > 0) %>%
+  summarise(run_hyper(genes = gene[is_de], background = gene, pathways = pathways)) %>% 
+  rename(cluster = split_level, pathway = label, de_genes = signature) %>%
+  ungroup() %>%
+  mutate(fdr = p.adjust(pval, method = 'fdr')) %>%
+  filter(fdr <= 0.1)
+
+select(hyper_res, cluster, pathway, fdr, de_genes, geneset, overlap, hits) %>%
+  DT::datatable(rownames = FALSE) %>%
+  DT::formatSignif(columns = c('fdr'), digits = 3)
+
+readr::write_excel_csv2(x = hyper_res, file = file.path(config$out_root, '05_DE_edgeR_per_cluster_mutant_vs_wildtype_enrich_higher_in_WT.csv'))
+```
+
+
+
+
+
+### Per cell type (filtered Azimuth predictions)
+
+Perform DE test between mutant and WT per cell type
+
+We only include cell types with at least 10 cells in at least 2 samples.
+
+```{r}
+sample_count <- colSums(table(s$orig.ident, s$az.annot.filtered) >= 10)
+coi <- names(sample_count)[sample_count > 1]
+s$az.annot.for.de <- s$az.annot.filtered
+s$az.annot.for.de[!(s$az.annot.for.de %in% coi)] <- NA
+
+table(s$orig.ident, s$az.annot.for.de)
+
+de <- run_edgeR_split(counts = GetAssayData(s, assay = "RNA", slot = "counts"), 
+                      group_labels = s$genotype, 
+                      sample_labels = s$orig.ident, 
+                      split_factor = s$az.annot.for.de)
+```
+
+Volcano plots
+```{r, fig.width=12, fig.height=12, out.width='100%'}
+p1 <- edgeR_conserved_plot_volcano(de, facet_var = 'split_level', ncol = 3)
+
+show(p1 + plot_annotation(title = 'NFATc1 mutant vs WT per predicted cell type', subtitle = 'positive fold change means higher expression in mutant'))
+```
+
+Show average expression per sample per cell type for the top markers
+```{r, fig.width=9, out.width='100%', fig.height=8}
+goi <- unique(de$top_markers$gene)
+df <- melt(t(as.matrix(s$RNA@counts[goi, ])), 
+           varnames = c('cell', 'gene'), 
+           value.name = 'count') %>% 
+  left_join(tibble::rownames_to_column(s@meta.data, var = 'cell'), by = 'cell') %>%
+  group_by(genotype, orig.ident, az.annot.for.de, gene) %>%
+  summarise(logCPM = log(sum(count) / sum(nCount_RNA) * 1e6 + 1)) %>%
+  group_by(gene) %>% 
+  mutate(expr_scaled = scales::oob_squish(x = scale(logCPM)[, 1], range = c(-3, 3)))
+levels(df$genotype) <- c('M', 'WT')[grepl('WT', levels(df$genotype)) + 1]
+
+mat <- acast(df, gene ~ az.annot.for.de + orig.ident, value.var = 'expr_scaled')
+tmp <- hclust(dist(mat, method = 'manhattan'), method = 'ward.D2')
+df$gene <- factor(df$gene, levels = rownames(mat)[tmp$order])
+
+p1 <- ggplot(df, aes(orig.ident, gene, fill = expr_scaled)) +
+  geom_tile(colour = "gray66") +
+  facet_grid(. ~ paste(az.annot.for.de, genotype), scales = 'free', space = 'free') +
+  scale_fill_gradient2(low = '#4d9221', mid = 'white', high = '#c51b7d', midpoint = 0,
+                       name = "Expression [rescaled]") +
+  theme(panel.spacing = unit(0, "lines")) +
+  labs(x = NULL, y = NULL) + 
+  scale_x_discrete(expand = c(0, 0)) + 
+  scale_y_discrete(expand = c(0, 0)) + 
+  theme(axis.text.x=element_blank()) + 
+  theme(axis.text.y=element_text(size=rel(0.8))) + 
+  theme(strip.text.x.top = element_text(angle = 90, hjust = 0)) +
+  theme(legend.position = "top", axis.ticks = element_blank())
+show(p1)
+```
+
+Show CD8 specific heatmap
+```{r, fig.width=6, out.width='60%', fig.height=7.5}
+celltypes <- unique(de$res$split_level)
+coi <- celltypes[grepl(pattern = '^CD8', x = celltypes)]
+top_markers <- filter(de$res, split_level %in% coi) %>%
+  filter(FDR < 0.05) %>%
+    group_by(split_level, sign(logFC)) %>% 
+    filter(rank(FDR, ties.method = "first") <= 30)
+
+goi <- unique(top_markers$gene)
+df <- melt(t(as.matrix(s$RNA@counts[goi, ])), 
+           varnames = c('cell', 'gene'), 
+           value.name = 'count') %>% 
+  left_join(tibble::rownames_to_column(s@meta.data, var = 'cell'), by = 'cell') %>%
+  filter(!is.na(az.annot.for.de)) %>%
+  filter(az.annot.for.de %in% coi) %>%
+  group_by(genotype, orig.ident, az.annot.for.de, gene) %>%
+  summarise(logCPM = log(sum(count) / sum(nCount_RNA) * 1e6 + 1)) %>%
+  group_by(gene) %>% 
+  mutate(expr_scaled = scales::oob_squish(x = scale(logCPM)[, 1], range = c(-3, 3)))
+levels(df$genotype) <- c('M', 'WT')[grepl('WT', levels(df$genotype)) + 1]
+
+mat <- acast(df, gene ~ az.annot.for.de + orig.ident, value.var = 'expr_scaled')
+tmp <- hclust(dist(mat, method = 'manhattan'), method = 'ward.D2')
+df$gene <- factor(df$gene, levels = rownames(mat)[tmp$order])
+
+p1 <- ggplot(df, aes(orig.ident, gene, fill = expr_scaled)) +
+  geom_tile(colour = "gray66") +
+  facet_grid(. ~ paste(az.annot.for.de, genotype), scales = 'free', space = 'free') +
+  scale_fill_gradient2(low = '#4d9221', mid = 'white', high = '#c51b7d', midpoint = 0,
+                       name = "Expression [rescaled]") +
+  theme(panel.spacing = unit(0, "lines")) +
+  labs(x = NULL, y = NULL) + 
+  scale_x_discrete(expand = c(0, 0)) + 
+  scale_y_discrete(expand = c(0, 0)) + 
+  theme(axis.text.x=element_blank()) + 
+  theme(axis.text.y=element_text(size=rel(1.0))) + 
+  theme(strip.text.x.top = element_text(angle = 90, hjust = 0)) +
+  theme(legend.position = "top", axis.ticks = element_blank())
+show(p1)
+```
+
+Create a single cell heatmap?
+```{r, fig.width=10, out.width='100%', fig.height=6}
+df <- melt(t(as.matrix(s$SCT@counts[goi, ])), 
+           varnames = c('cell', 'gene'), 
+           value.name = 'expr') %>% 
+  left_join(tibble::rownames_to_column(s@meta.data, var = 'cell'), by = 'cell') %>%
+  filter(!is.na(az.annot.for.de)) %>%
+  filter(az.annot.for.de %in% coi) %>%
+  group_by(gene) %>% 
+  mutate(log_expr = log(expr + 1), 
+         expr_scaled = scales::oob_squish(x = scale(log(expr + 1))[, 1], range = c(-2, 2)))
+levels(df$genotype) <- c('M', 'WT')[grepl('WT', levels(df$genotype)) + 1]
+df <- arrange(df, gene, genotype, az.annot.for.de, orig.ident)
+df$cell <- factor(df$cell, levels = unique(df$cell))
+mat <- acast(df, gene ~ cell, value.var = 'expr_scaled')
+mat <- mat[rev(tmp$labels[tmp$order]), ]
+ph_df <- filter(df, gene == rownames(mat)[1]) %>% 
+  tibble::column_to_rownames(var = 'cell') %>%
+  select(genotype, az.annot.for.de) %>%
+  dplyr::rename(celltype = az.annot.for.de)
+pheatmap::pheatmap(mat, cluster_rows = FALSE, cluster_cols = FALSE, show_colnames = FALSE, 
+                   color = colorRampPalette(colors = c('#4d9221', 'white', '#c51b7d'))(11),
+                   annotation_col = ph_df)
+```
+
+Change the ordering - first celltype, the genotype
+```{r, fig.width=10, out.width='100%', fig.height=6}
+df <- arrange(df, gene, az.annot.for.de, genotype, orig.ident)
+df$cell <- factor(df$cell, levels = unique(df$cell))
+mat <- acast(df, gene ~ cell, value.var = 'expr_scaled')
+mat <- mat[rev(tmp$labels[tmp$order]), ]
+ph_df <- filter(df, gene == rownames(mat)[1]) %>% 
+  tibble::column_to_rownames(var = 'cell') %>%
+  select(genotype, az.annot.for.de) %>%
+  dplyr::rename(celltype = az.annot.for.de)
+pheatmap::pheatmap(mat, cluster_rows = FALSE, cluster_cols = FALSE, show_colnames = FALSE, 
+                   color = colorRampPalette(colors = c('#4d9221', 'white', '#c51b7d'))(11),
+                   annotation_col = ph_df)
+```
+
+Since there are so few genes, we might as well use violin plots
+```{r, fig.width=10, out.width='100%', fig.height=8}
+p1 <- ggplot(df, aes(az.annot.for.de, log_expr, fill = genotype)) +
+  geom_violin(scale = 'width') +
+  ggbeeswarm::geom_quasirandom(alpha = 0.2, dodge.width=0.9, size = 0.5, shape = 16) +
+  facet_wrap(~ gene, scales = 'free_y') +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  xlab('Celltype') +
+  ylab('Expression (log-counts)') +
+  scale_fill_discrete(name = 'Genotype', labels = c('Mutant', 'Wildtype'))
+show(p1)
+```
+
+
+
+Write DE results to file
+```{r}
+# add the mean expression per sample per cluster to the results
+tmp <- melt(t(as.matrix(s$RNA@counts[unique(de$res$gene), ])), 
+           varnames = c('cell', 'gene'), 
+           value.name = 'count') %>% 
+  left_join(tibble::rownames_to_column(s@meta.data, var = 'cell'), by = 'cell') %>%
+  group_by(genotype, orig.ident, az.annot.for.de, gene) %>%
+  summarise(logCPM = log(sum(count) / sum(nCount_RNA) * 1e6 + 1)) %>%
+  dcast(gene + az.annot.for.de ~ orig.ident, value.var = 'logCPM')
+
+colnames(tmp)[3:ncol(tmp)] <- paste0('logCPM_', colnames(tmp)[3:ncol(tmp)])
+tmp <- left_join(de$res, tmp, by = c('gene' = 'gene', 'split_level' = 'az.annot.for.de')) %>% 
+  dplyr::rename(cell_type = split_level)
+filename <- '05_DE_edgeR_per_cell_type_mutant_vs_wildtype.csv'
+message(sprintf('Output file name: %s', filename))
+readr::write_excel_csv2(x = tmp, file = file.path(config$out_root, filename))
+```
+
+Also show the significant DE results here (FDR < 0.05)
+```{r}
+filter(de$res, FDR < 0.05) %>%
+  rename(cluster = split_level) %>%
+  select(cluster, gene, logFC, logCPM, PValue, FDR) %>%
+  DT::datatable(rownames = FALSE) %>%
+  DT::formatSignif(columns = c('logFC', 'logCPM', 'PValue', 'FDR'), digits = 3)
+```
+
+### {.tabset}
+
+Enrichment analysis
+
+#### DE genes higher in mutant
+```{r}
+# for the genes higher in mutant
+hyper_res <- group_by(de$res, split_level) %>%
+  mutate(is_de = FDR < 0.05 & logFC < 0) %>%
+  summarise(run_hyper(genes = gene[is_de], background = gene, pathways = pathways)) %>% 
+  rename(cell_type = split_level, pathway = label, de_genes = signature) %>%
+  ungroup() %>%
+  mutate(fdr = p.adjust(pval, method = 'fdr')) %>%
+  filter(fdr <= 0.1)
+
+select(hyper_res, cell_type, pathway, fdr, de_genes, geneset, overlap, hits) %>%
+  DT::datatable(rownames = FALSE) %>%
+  DT::formatSignif(columns = c('fdr'), digits = 3)
+
+readr::write_excel_csv2(x = hyper_res, file = file.path(config$out_root, '05_DE_edgeR_per_cell_type_mutant_vs_wildtype_enrich_higher_in_mutant.csv'))
+```
+
+#### DE genes higher in WT
+```{r}
+# for the genes higher in mutant
+hyper_res <- group_by(de$res, split_level) %>%
+  mutate(is_de = FDR < 0.05 & logFC > 0) %>%
+  summarise(run_hyper(genes = gene[is_de], background = gene, pathways = pathways)) %>% 
+  rename(cell_type = split_level, pathway = label, de_genes = signature) %>%
+  ungroup() %>%
+  mutate(fdr = p.adjust(pval, method = 'fdr')) %>%
+  filter(fdr <= 0.1)
+
+select(hyper_res, cell_type, pathway, fdr, de_genes, geneset, overlap, hits) %>%
+  DT::datatable(rownames = FALSE) %>%
+  DT::formatSignif(columns = c('fdr'), digits = 3)
+
+readr::write_excel_csv2(x = hyper_res, file = file.path(config$out_root, '05_DE_edgeR_per_cell_type_mutant_vs_wildtype_enrich_higher_in_WT.csv'))
+```
+
+
+### Per T cell compartment
+
+Perform DE test between mutant and WT per T cell compartment (CD4, CD8)
+
+Define compartments
+```{r}
+s$tcom <- stringr::str_extract(string = s$az.annot.filtered, pattern = '^CD[48]')
+s$tcom[!is.na(s$tcom)] <- paste0(s$tcom[!is.na(s$tcom)], '+ T cells')
+s$az.annot.for.de <- s$tcom
+```
+
+```{r}
+de <- run_edgeR_split(counts = GetAssayData(s, assay = "RNA", slot = "counts"), 
+                     group_labels = s$genotype, 
+                     sample_labels = s$orig.ident, 
+                     split_factor = s$tcom, top_n = 10, pval_clip = 1e-15)
+```
+
+Volcano plots
+```{r, fig.width=8, fig.height=5, out.width='100%'}
+p1 <- edgeR_conserved_plot_volcano(de, facet_var = 'split_level', ncol = 2) +
+  ylab("-log10 of p-value clipped to range [1e-15, 1]")
+
+show(p1 + plot_annotation(title = 'NFATc1 mutant vs WT per T cell compartment', subtitle = 'negative fold change means higher expression in mutant'))
+```
+
+Show average expression per sample per cell type for the top markers
+```{r, fig.width=3.5, out.width='35%', fig.height=8}
+goi <- filter(de$res, FDR < 0.05) %>%
+    group_by(split_level, sign(logFC)) %>% 
+    filter(rank(FDR, ties.method = "first") <= 20) %>%
+  pull(gene) %>% unique()
+
+coi <- !is.na(s$az.annot.for.de)
+df <- melt(t(as.matrix(s$RNA@counts[goi, coi])), 
+           varnames = c('cell', 'gene'), 
+           value.name = 'count') %>% 
+  left_join(tibble::rownames_to_column(s@meta.data, var = 'cell'), by = 'cell') %>%
+  group_by(genotype, orig.ident, az.annot.for.de, gene) %>%
+  summarise(logCPM = log(sum(count) / sum(nCount_RNA) * 1e6 + 1)) %>%
+  group_by(gene) %>% 
+  mutate(expr_scaled = scales::oob_squish(x = scale(logCPM)[, 1], range = c(-2, 2)))
+levels(df$genotype) <- c('M', 'WT')[grepl('WT', levels(df$genotype)) + 1]
+
+mat <- acast(df, gene ~ az.annot.for.de + orig.ident, value.var = 'expr_scaled')
+tmp <- hclust(dist(mat, method = 'euclidean'), method = 'ward.D2')
+df$gene <- factor(df$gene, levels = rownames(mat)[tmp$order])
+
+p1 <- ggplot(df, aes(orig.ident, gene, fill = expr_scaled)) +
+  geom_tile(colour = "gray66") +
+  facet_grid(. ~ paste(az.annot.for.de, genotype), scales = 'free', space = 'free') +
+  scale_fill_gradient2(low = '#4d9221', mid = 'white', high = '#c51b7d', midpoint = 0,
+                       name = "Expression [rescaled]") +
+  theme(panel.spacing = unit(0, "lines")) +
+  labs(x = NULL, y = NULL) + 
+  scale_x_discrete(expand = c(0, 0)) + 
+  scale_y_discrete(expand = c(0, 0)) + 
+  theme(axis.text.x=element_blank()) + 
+  theme(axis.text.y=element_text(size=rel(0.8))) + 
+  theme(strip.text.x.top = element_text(angle = 90, hjust = 0)) +
+  theme(legend.position = "top", axis.ticks = element_blank())
+show(p1)
+```
+
+Write DE results to file
+```{r}
+# add the mean expression per sample per cluster to the results
+tmp <- melt(t(as.matrix(s$RNA@counts[unique(de$res$gene), ])), 
+           varnames = c('cell', 'gene'), 
+           value.name = 'count') %>% 
+  left_join(tibble::rownames_to_column(s@meta.data, var = 'cell'), by = 'cell') %>%
+  group_by(genotype, orig.ident, az.annot.for.de, gene) %>%
+  summarise(logCPM = log(sum(count) / sum(nCount_RNA) * 1e6 + 1)) %>%
+  dcast(gene + az.annot.for.de ~ orig.ident, value.var = 'logCPM')
+
+colnames(tmp)[3:ncol(tmp)] <- paste0('logCPM_', colnames(tmp)[3:ncol(tmp)])
+tmp <- left_join(de$res, tmp, by = c('gene' = 'gene', 'split_level' = 'az.annot.for.de')) %>% 
+  dplyr::rename(cell_type = split_level)
+filename <- '05_DE_edgeR_per_tcell_type_mutant_vs_wildtype.csv'
+message(sprintf('Output file name: %s', filename))
+readr::write_excel_csv2(x = tmp, file = file.path(config$out_root, filename))
+```
+
+### For all T cells together
+
+Define groups
+```{r}
+s$az.annot.for.de <- rep(NA, ncol(s))
+s$az.annot.for.de[grepl(pattern = '^CD[48]|^Treg', x = s$az.annot.filtered)] <- 'T cell'
+```
+
+```{r}
+de <- run_edgeR_split(counts = GetAssayData(s, assay = "RNA", slot = "counts"), 
+                     group_labels = s$genotype, 
+                     sample_labels = s$orig.ident, 
+                     split_factor = s$az.annot.for.de, top_n = 10, pval_clip = 1e-15)
+```
+
+Volcano plot
+```{r, fig.width=5, fig.height=5, out.width='50%'}
+p1 <- edgeR_conserved_plot_volcano(de, facet_var = 'split_level', ncol = 2) +
+  ylab("-log10 of p-value clipped to range [1e-15, 1]") 
+
+show(p1 + plot_annotation(title = 'NFATc1 mutant vs WT per T cell compartment', subtitle = 'negative fold change means higher expression in mutant'))
+```
+
+Write DE results to file
+```{r}
+# add the mean expression per sample per cluster to the results
+tmp <- melt(t(as.matrix(s$RNA@counts[unique(de$res$gene), ])), 
+           varnames = c('cell', 'gene'), 
+           value.name = 'count') %>% 
+  left_join(tibble::rownames_to_column(s@meta.data, var = 'cell'), by = 'cell') %>%
+  group_by(genotype, orig.ident, az.annot.for.de, gene) %>%
+  summarise(logCPM = log(sum(count) / sum(nCount_RNA) * 1e6 + 1)) %>%
+  dcast(gene + az.annot.for.de ~ orig.ident, value.var = 'logCPM')
+
+colnames(tmp)[3:ncol(tmp)] <- paste0('logCPM_', colnames(tmp)[3:ncol(tmp)])
+tmp <- left_join(de$res, tmp, by = c('gene' = 'gene', 'split_level' = 'az.annot.for.de')) %>% 
+  dplyr::rename(cell_type = split_level)
+filename <- '05_DE_edgeR_per_tcells_mutant_vs_wildtype.csv'
+message(sprintf('Output file name: %s', filename))
+readr::write_excel_csv2(x = tmp, file = file.path(config$out_root, filename))
+```
+
+## Runtime and session info
+
+Runtime: `r time_diff(start_time)`
+
+Session Info
+```{r}
+sessionInfo()
+```

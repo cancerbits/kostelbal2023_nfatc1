@@ -1,0 +1,606 @@
+---
+title: 'make figures'
+author: 'Christoph Hafemeister'
+date: '`r format(Sys.time(), "%B %d, %Y %H:%M:%S %Z")`'
+output:
+  html_document:
+    toc: TRUE
+    toc_depth: 3
+    toc_float: TRUE
+    code_folding: "hide"
+params:
+  config_file: "config.yaml"
+---
+
+# Setup
+
+```{r}
+# load project-specific parameters
+config <- yaml::read_yaml(params$config_file)
+
+suppressPackageStartupMessages({
+  library('Matrix')
+  library('dplyr')
+  library('Seurat')
+  library('sctransform')
+  library('reshape2')
+  library('ggplot2')
+  library('patchwork')
+  library('ggrepel')
+  source(file.path(config$project_root, 'R', 'utils.r'))
+})
+
+#future::plan(strategy = "multiprocess", workers = 1)
+#options(future.globals.maxSize = 8 * 1024 ^ 3)
+#options(future.fork.enable = TRUE)
+
+knitr::opts_chunk$set(comment = NA, fig.width = 5, fig.height = 3.5, out.width = '60%',
+                      warning = TRUE, error = TRUE, echo = TRUE, message = TRUE,
+                      dpi = 100)
+options(dplyr.summarise.inform = FALSE)
+options(tibble.width = Inf)
+options(DT.options = list(paging = TRUE, searching = TRUE, autoWidth = TRUE))
+options(ggrepel.max.overlaps = Inf)
+
+old <- theme_set(theme_bw(base_size = 11))
+set.seed(8569205)
+start_time <- proc.time()['elapsed']
+```
+
+# Read data and prep
+
+```{r}
+s <- readRDS(file = file.path(config$out_root, '02_integration_NFATc1_s.rds'))
+md <- readRDS(file = file.path(config$out_root, '03_integrated_NFATc1_annotated_meta_data.rds'))
+az_umap <- readRDS(file = file.path(config$out_root, '03_integrated_NFATc1_annotated_az_umap.rds'))
+```
+
+Change sample names
+```{r}
+new_name <- function(old_name) {
+  old_name <- stringr::str_replace(old_name, pattern = '_[A-Z0-9]+$', replacement = '')
+  ret <- sapply(old_name, function(on) {
+    if (grepl(pattern = '^KB[1234]', x = on)) {
+      nn <- stringr::str_replace(on, pattern = 'KB(?=[1234])', replacement = 'ND')
+    } else {
+      n <- as.numeric(gsub('KB', '', on))
+      nn <- sprintf('P%d', n - 6)
+    }
+    return(nn)
+  })
+  ret
+}
+md$orig.ident <- new_name(md$orig.ident)
+s@meta.data$orig.ident <- new_name(s@meta.data$orig.ident)
+```
+
+Set up colors
+```{r}
+#genotype_cols <- c(hcl.colors(n = 4, palette = 'Blues2')[2], hcl.colors(n = 4, palette = 'Reds2')[2])
+#genotype_cols <- c('gray45', 'deeppink')
+genotype_cols <- c('#263f82', '#c9443b')
+genotype_order <- c('WT', 'NFATc1 mutant')
+names(genotype_cols) <- genotype_order
+```
+
+
+# UMAP
+
+Azimuth coordinates and predictions
+```{r}
+df <- cbind(md, s@reductions$int_umap@cell.embeddings, az_umap@cell.embeddings) %>%
+  mutate(UMAP_1 = az_umap_1, UMAP_2 = az_umap_2)
+df$genotype <- factor(df$genotype, levels = genotype_order)
+df_lab <- group_by(df, az.annotation) %>%
+  summarise(UMAP_1 = median(az_umap_1),
+            UMAP_2 = median(az_umap_2),
+            .groups = 'drop')
+p1 <- ggplot(df, aes(UMAP_1, UMAP_2, color = az.annotation, label = az.annotation)) +
+  geom_point() + 
+  geom_label_repel(data = df_lab) +
+  theme_classic() +
+  theme(legend.position = 'none') +
+  theme(axis.ticks = element_blank(), axis.text = element_blank())
+show(p1)
+```
+
+Group some cell types
+```{r}
+df <- mutate(df, celltype = case_when(
+  stringr::str_starts(az.annotation, 'B ') ~ 'B cells',
+  stringr::str_starts(az.annotation, 'NK') ~ 'NK cells',
+  stringr::str_starts(az.annotation, 'CD4 ') ~ 'CD4 T cells',
+  stringr::str_starts(az.annotation, 'CD8 ') ~ 'CD8 T cells',
+  TRUE ~ az.annotation
+))
+df_lab <- group_by(df, celltype) %>%
+  summarise(UMAP_1 = median(az_umap_1),
+            UMAP_2 = median(az_umap_2),
+            .groups = 'drop')
+p2 <- ggplot(df, aes(UMAP_1, UMAP_2, color = celltype, label = celltype)) +
+  geom_point() + 
+  geom_label_repel(data = df_lab) +
+  theme_classic() +
+  theme(legend.position = 'none') +
+  theme(axis.ticks = element_blank(), axis.text = element_blank())
+show(p2)
+```
+
+Exclude cells with low confidence cell type prediction (use the non-grouped annotation)
+```{r}
+df_filtered <- filter(df, !is.na(az.annot.filtered))
+df_lab <- group_by(df_filtered, az.annotation) %>%
+  summarise(UMAP_1 = median(az_umap_1),
+            UMAP_2 = median(az_umap_2),
+            .groups = 'drop')
+p3 <- ggplot(df_filtered, aes(UMAP_1, UMAP_2, color = az.annotation, label = az.annotation)) +
+  geom_point() + 
+  geom_label_repel(data = df_lab) +
+  theme_classic() +
+  theme(legend.position = 'none') +
+  theme(axis.ticks = element_blank(), axis.text = element_blank())
+show(p3)
+```
+
+Further exclude cell types we see less than 20 times
+```{r}
+tab <- table(df_filtered$az.annotation)
+keep_ct <- names(tab)[tab >= 20]
+df_filtered2 <- filter(df_filtered, az.annotation %in% keep_ct) %>%
+  mutate(az.annotation = case_when(
+    stringr::str_starts(az.annotation, 'B ') ~ 'B cells',
+    stringr::str_starts(az.annotation, 'NK') ~ 'NK cells',
+    TRUE ~ az.annotation
+  ))
+df_lab <- group_by(df_filtered2, az.annotation) %>%
+  summarise(UMAP_1 = median(az_umap_1),
+            UMAP_2 = median(az_umap_2),
+            .groups = 'drop') %>%
+  mutate(label = az.annotation)
+p4 <- ggplot(df_filtered2, aes(UMAP_1, UMAP_2, color = az.annotation, label = az.annotation)) +
+  geom_point(shape = 16, size = 1) + 
+  geom_text_repel(data = df_lab, size = 3, color = 'black', max.overlaps = Inf, min.segment.length = 0.2, point.size = NA) +
+  theme_classic() +
+  theme(legend.position = 'none') +
+  theme(axis.ticks = element_blank(), axis.text = element_blank()) +
+  scale_color_manual(values = hcl.colors(n = 12, palette = 'set2'))
+show(p4)
+```
+
+Same cells as above, but show control / patient info
+```{r}
+p5 <- ggplot(df_filtered2, aes(UMAP_1, UMAP_2, color = genotype)) +
+  geom_point(data = filter(df_filtered2, genotype == 'WT'), alpha = 0.5, shape = 16) + 
+  geom_point(data = filter(df_filtered2, genotype != 'WT'), alpha = 0.5, shape = 16, size = 0.3) + 
+  scale_color_manual(values = genotype_cols) +
+  theme_classic() +
+  theme(axis.ticks = element_blank(), axis.text = element_blank())
+show(p5)
+```
+
+Create PDF
+```{r}
+cairo_pdf(filename = file.path(config$out_root, '06_NFATc1_UMAP.pdf'), width = 7.5, height = 3)
+show(p4 | p5)
+dev.off()
+```
+
+# Fractions of cell types
+
+Fractions for all cells
+```{r}
+cp <- composition_plots(df = md, group_var = 'orig.ident', 
+                        comp_var = 'az.annotation', group_name = 'Sample', 
+                        comp_name = 'Cell type')
+p1 <- ggplot(cp$data, aes(Sample, freq)) + geom_point() +
+  ylab('Fraction') + xlab('Sample') +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap(~ label_filtered, scales = 'free_y', ncol = 5) +
+  theme(legend.position = "none")
+show(p1)
+```
+Create PDF
+```{r}
+cairo_pdf(filename = file.path(config$out_root, '06_NFATc1_cell_type_fractions.pdf'), width = 9, height = 7)
+show(p1)
+dev.off()
+```
+
+Fractions for filtered (high confidence prediction) cells
+```{r}
+cp <- composition_plots(df = df_filtered2, group_var = 'orig.ident', 
+                        comp_var = 'az.annotation', group_name = 'Sample', 
+                        comp_name = 'Cell type')
+cp$data$genotype <- c('NFATc1 mutant', 'WT')[grepl('^ND', cp$data$Sample ) + 1]
+cp$data$genotype <- factor(cp$data$genotype, levels = c('WT', 'NFATc1 mutant'))
+
+p1 <- ggplot(cp$data, aes(Sample, freq, fill = genotype)) + 
+  geom_bar(stat = 'identity') +
+  scale_fill_manual(values = genotype_cols) +
+  ylab('Fraction') + xlab('Sample') +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap(~ label_filtered, scales = 'free_y', ncol = 4) +
+  theme(legend.position = "none") +
+  theme(panel.grid.major.y = element_line(rel(0.5), color="grey75"))
+show(p1)
+```
+Create PDF
+```{r}
+cairo_pdf(filename = file.path(config$out_root, '06_NFATc1_cell_type_fractions_highconf.pdf'), width = 7, height = 5)
+show(p1)
+dev.off()
+```
+
+
+
+# Clonotypes
+
+Clonality based on cells with exactly one A and B chain
+```{r}
+cl_dat <- readRDS(file = file.path(config$out_root, '04_clonotypes_NFATc1.rds'))
+cl_dat$clono_dat$sample_id <- new_name(cl_dat$clono_dat$sample_id)
+df <- arrange(cl_dat$clono_dat, sample_id, barcode, chain) %>%
+  group_by(sample_id, barcode, chain) %>%
+  mutate(chain_n = n(), chain_cdr3 = paste(chain, cdr3, sep=':'), 
+         isAorB = stringr::str_starts(chain, 'TR[AB]')) %>%
+  ungroup() %>%
+  filter(chain_n == 1, isAorB) %>%
+  group_by(sample_id, barcode) %>%
+  summarise(bc_n = n(), clonotype = paste(chain_cdr3, collapse = ';'), .groups = 'drop') %>%
+  filter(bc_n == 2) %>%
+  group_by(sample_id) %>%
+  summarise(cells = n(), clonotypes = length(unique(clonotype)), clonality = 1 - norm_entropy(clonotype))
+df$genotype <- c('NFATc1 mutant', 'WT')[grepl('^ND', df$sample_id ) + 1]
+df$genotype <- factor(df$genotype, levels = c('WT', 'NFATc1 mutant'))
+
+
+
+p1 <- ggplot(df, aes(sample_id, clonality, fill = genotype)) + 
+  geom_bar(stat = 'identity') + 
+  scale_fill_manual(values = genotype_cols) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  xlab('Sample') + ylab('Clonality') +
+  theme(panel.grid.major.y = element_line(rel(0.5), color="grey75")) +
+  theme(legend.position = "none")
+show(p1)
+```
+
+Create PDF
+```{r}
+cairo_pdf(filename = file.path(config$out_root, '06_NFATc1_clonality01.pdf'), width = 2, height = 3)
+show(p1)
+dev.off()
+```
+
+
+Clanality plots in form of treemap
+```{r}
+df <- arrange(cl_dat$clono_dat, sample_id, barcode, chain) %>%
+  group_by(sample_id, barcode, chain) %>%
+  mutate(chain_n = n(), chain_cdr3 = paste(chain, cdr3, sep=':'), 
+         isAorB = stringr::str_starts(chain, 'TR[AB]')) %>%
+  ungroup() %>%
+  filter(chain_n == 1, isAorB) %>%
+  group_by(sample_id, barcode) %>%
+  summarise(bc_n = n(), clonotype = paste(chain_cdr3, collapse = ';'), .groups = 'drop') %>%
+  filter(bc_n == 2) %>%
+  group_by(sample_id, clonotype) %>%
+  summarise(n = n(), .groups = 'drop')
+
+# if we need colors, check, Set2, Set3, Accent
+# or just use the genotype colors
+fill_col <- colorspace::lighten(genotype_cols, amount = 0.3)
+
+# need to manually arrange treemaps
+grid::grid.newpage()
+grid::pushViewport(grid::viewport(layout = grid::grid.layout(2, 3), name = 'myvp'))
+vplayout <- function(x, y) grid::viewport(layout.pos.row = x, layout.pos.col = y)
+i <- 0
+for (sam in unique(df$sample_id)) {
+  filter(df, sample_id == sam) %>%
+    treemap::treemap(index = 'clonotype', vSize = 'n', type = 'index', 
+                     palette = fill_col[grepl('^P\\d+$', sam) + 1], 
+                     title = sam,
+                     vp = vplayout(i %% 2 + 1, i %/% 2 + 1))
+  i <- i + 1
+}
+
+# Again for pdf
+cairo_pdf(filename = file.path(config$out_root, '06_NFATc1_clonality_treemap.pdf'), width = 8, height = 5.8)
+grid::grid.newpage()
+grid::pushViewport(grid::viewport(layout = grid::grid.layout(2, 3), name = 'myvp'))
+vplayout <- function(x, y) grid::viewport(layout.pos.row = x, layout.pos.col = y)
+i <- 0
+for (sam in unique(df$sample_id)) {
+  filter(df, sample_id == sam) %>%
+    treemap::treemap(index = 'clonotype', vSize = 'n', type = 'index', 
+                     palette = fill_col[grepl('^P\\d+$', sam) + 1], 
+                     title = sam,
+                     vp = vplayout(i %% 2 + 1, i %/% 2 + 1))
+  i <- i + 1
+}
+dev.off()
+```
+
+
+
+
+Clonality per cell type (filtered Azimuth predictions)
+
+Cells used: Cells that are in RNA-seq data and have exactly one TRA and TRB chain
+
+```{r, fig.width=8, out.width='80%', fig.height=5}
+ctoi <- c('CD4 Naive', 'CD4 TCM', 'CD4 TEM', 'CD8 Naive', 'CD8 TCM', 'CD8 TEM')
+df <- filter(cl_dat$md, chains == 'TRA:1;TRB:1', !is.na(az.annot.filtered)) %>%
+  dplyr::rename(celltype = az.annot.filtered) %>%
+  group_by(sample_id, celltype) %>%
+  summarise(cells = n(), clonotypes = length(unique(clonotype)), clonality = 1 - norm_entropy(clonotype)) %>%
+  filter(celltype %in% ctoi) %>%
+  mutate(celltype = factor(celltype, levels = ctoi),
+         sample_id = new_name(sample_id))
+df$genotype <- c('NFATc1 mutant', 'WT')[grepl('^ND', df$sample_id) + 1]
+df$genotype <- factor(df$genotype, levels = c('WT', 'NFATc1 mutant'))
+
+p1 <- ggplot(df, aes(sample_id, clonality, size = cells, color = genotype)) + 
+  geom_point() +
+  scale_color_manual(values = genotype_cols) +
+  facet_wrap(~ celltype, ncol = 3) +
+  xlab('Sample ID') + ylab('Clonality') +
+  coord_cartesian(ylim = c(-0.05, 0.75)) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position="bottom", panel.grid.minor = element_blank()) +
+  theme(panel.grid.major.y = element_line(rel(0.5), color="grey75"))
+show(p1)
+```
+
+Create PDF
+```{r}
+cairo_pdf(filename = file.path(config$out_root, '06_NFATc1_clonality02.pdf'), width = 5, height = 4)
+show(p1)
+dev.off()
+```
+
+# Differential expression
+
+Pseudobulk DE
+
+```{r}
+filename <- '05_DE_edgeR_pseudobulk_mutant_vs_wildtype.csv'
+de_res <- readr::read_csv2(file = file.path(config$out_root, filename))
+```
+```{r}
+top_markers <- filter(de_res, FDR < 0.05) %>%
+    group_by(sign(logFC)) %>% 
+    filter(rank(FDR, ties.method = "first") <= 10) 
+
+p1 <- ggplot(de_res, aes(logFC, -log10(pval_clipped))) + 
+  geom_point(aes(color = factor(FDR < 0.05, levels = c(TRUE, FALSE))), shape = 19) + 
+  #geom_point(data = top_markers, color = "deeppink") + 
+  geom_text_repel(data = top_markers, mapping = aes(label = gene)) + 
+  geom_point(data = top_markers, aes(fill = factor(FDR < 0.05, levels = c(TRUE, FALSE))), shape = 21, color = 'black') + 
+  scale_color_manual(name = 'FDR < 0.05', values = c('tomato', 'gray66')) +
+  scale_fill_manual(guide = 'none', values = c('tomato', 'gray66')) +
+  ylab("-log10 p-value (clipped at 20)") + 
+  xlab("logFC") +
+  theme_classic() +
+  theme(panel.grid.minor = element_blank()) +
+  #theme(legend.position = "bottom") + 
+  theme(legend.position = c(0.95, 0.95), legend.justification = c(1,1), 
+        legend.box.background = theme_get()$rect)
+show(p1)
+```
+
+Create PDF
+```{r}
+cairo_pdf(filename = file.path(config$out_root, '06_NFATc1_pseudobulk_de.pdf'), width = 5, height = 4)
+show(p1)
+dev.off()
+```
+
+DE per T cell compartment
+
+```{r}
+filename <- '05_DE_edgeR_per_tcell_type_mutant_vs_wildtype.csv'
+de_res <- readr::read_csv2(file = file.path(config$out_root, filename))
+```
+```{r}
+top_markers <- filter(de_res, FDR < 0.05) %>%
+    group_by(cell_type, sign(logFC)) %>% 
+    filter(rank(FDR, ties.method = "first") <= 10) 
+
+p1 <- ggplot(de_res, aes(logFC, -log10(pval_clipped))) + 
+  geom_point(aes(color = factor(FDR < 0.05, levels = c(TRUE, FALSE))), shape = 19) + 
+  geom_text_repel(data = top_markers, mapping = aes(label = gene)) + 
+  geom_point(data = top_markers, aes(fill = factor(FDR < 0.05, levels = c(TRUE, FALSE))), shape = 21, color = 'black') + 
+  scale_color_manual(name = 'FDR < 0.05', values = c('tomato', 'gray66')) +
+  scale_fill_manual(guide = 'none', values = c('tomato', 'gray66')) +
+  ylab("-log10 p-value (clipped at 15)") + 
+  xlab("logFC") +
+  facet_wrap(~ cell_type) +
+  theme_classic() +
+  theme(panel.grid.minor = element_blank()) +
+  theme(legend.position = c(0.01, 0.02), legend.justification = c(0,0), 
+        legend.box.background = theme_get()$rect)
+show(p1)
+```
+Create PDF
+```{r}
+cairo_pdf(filename = file.path(config$out_root, '06_NFATc1_tcell_de.pdf'), width = 8, height = 4)
+show(p1)
+dev.off()
+```
+
+Load annotated object
+```{r}
+s  <- readRDS(file = file.path(config$out_root, '02_integration_NFATc1_s.rds'))
+md <- readRDS(file = file.path(config$out_root, '03_integrated_NFATc1_annotated_meta_data.rds'))
+s <- AddMetaData(s, md)
+
+keep <- s$orig.ident %in% c('KB1_NDBR', 'KB2_NDRJH', 'KB3_PID355', 'KB4_IBD238',  
+                            'KB7_PID1180', 'KB8_PID1185')
+s <- s[, keep]
+s$genotype <- factor(as.character(droplevels(s$genotype)), levels = c("NFATc1 mutant", 'WT'))
+
+s$tcom <- stringr::str_extract(string = s$az.annot.filtered, pattern = '^CD[48]')
+s$tcom[!is.na(s$tcom)] <- paste0(s$tcom[!is.na(s$tcom)], '+ T cells')
+s$az.annot.for.de <- s$tcom
+```
+
+Show average expression per sample per cell type for the top markers
+```{r, fig.width=3.5, out.width='35%', fig.height=8}
+goi <- filter(de_res, FDR < 0.05) %>%
+    group_by(cell_type, sign(logFC)) %>% 
+    filter(rank(FDR, ties.method = "first") <= 20) %>%
+  pull(gene) %>% unique()
+
+coi <- !is.na(s$az.annot.for.de)
+df <- melt(t(as.matrix(s$RNA@counts[goi, coi])), 
+           varnames = c('cell', 'gene'), 
+           value.name = 'count') %>% 
+  left_join(tibble::rownames_to_column(s@meta.data, var = 'cell'), by = 'cell') %>%
+  group_by(genotype, orig.ident, az.annot.for.de, gene) %>%
+  summarise(logCPM = log(sum(count) / sum(nCount_RNA) * 1e6 + 1)) %>%
+  group_by(gene) %>% 
+  mutate(expr_scaled = scales::oob_squish(x = scale(logCPM)[, 1], range = c(-2, 2)))
+levels(df$genotype) <- c('M', 'WT')[grepl('WT', levels(df$genotype)) + 1]
+df$genotype <- factor(as.character(df$genotype), levels = c('WT', 'M'), ordered = TRUE)
+df$orig.ident <- factor(df$orig.ident, levels = c('KB1_NDBR', 'KB2_NDRJH', 'KB3_PID355', 'KB4_IBD238', 'KB7_PID1180', 'KB8_PID1185'), ordered = TRUE)
+
+mat <- acast(df, gene ~ az.annot.for.de + orig.ident, value.var = 'expr_scaled')
+tmp <- hclust(dist(mat, method = 'euclidean'), method = 'ward.D2')
+df$gene <- factor(df$gene, levels = rownames(mat)[tmp$order])
+df$facet <- paste(df$az.annot.for.de, df$genotype, sep = ' ')
+df$facet <- factor(df$facet, levels = unique(df$facet[order(df$az.annot.for.de, df$genotype)]))
+
+p1 <- ggplot(df, aes(orig.ident, gene, fill = expr_scaled)) +
+  geom_tile(colour = "gray66") +
+  facet_grid(. ~ facet, scales = 'free', space = 'free') +
+  scale_fill_gradient2(low = '#282e58', mid = 'white', high = '#b0403d', midpoint = 0,
+                       name = "Expression\n[z-score, clipped]") +
+  theme(panel.spacing = unit(0, "lines")) +
+  labs(x = NULL, y = NULL) + 
+  scale_x_discrete(expand = c(0, 0)) + 
+  scale_y_discrete(expand = c(0, 0)) + 
+  theme(axis.text.x=element_blank()) + 
+  theme(axis.text.y=element_text(size=rel(0.8))) + 
+  theme(strip.text.x.top = element_text(angle = 90, hjust = 0)) +
+  theme(legend.position = "top", axis.ticks = element_blank())
+show(p1)
+```
+Create PDF
+```{r}
+cairo_pdf(filename = file.path(config$out_root, '06_NFATc1_tcell_de_heatmap.pdf'), width = 3.5, height = 7)
+show(p1)
+dev.off()
+```
+
+
+Single cell expression for CD8 cell types (heatmap)
+
+```{r}
+s  <- readRDS(file = file.path(config$out_root, '02_integration_NFATc1_s.rds'))
+md <- readRDS(file = file.path(config$out_root, '03_integrated_NFATc1_annotated_meta_data.rds'))
+s <- AddMetaData(s, md)
+
+keep <- s$orig.ident %in% c('KB1_NDBR', 'KB2_NDRJH', 'KB3_PID355', 'KB4_IBD238',  
+                            'KB7_PID1180', 'KB8_PID1185')
+s <- s[, keep]
+s$genotype <- factor(as.character(droplevels(s$genotype)), levels = c("NFATc1 mutant", 'WT'))
+s$az.annot.for.de <- s$az.annot.filtered
+```
+
+```{r}
+filename <- '05_DE_edgeR_per_cell_type_mutant_vs_wildtype.csv'
+de <- list()
+de$res <- readr::read_csv2(file = file.path(config$out_root, filename)) %>%
+  mutate(split_level = cell_type)
+
+celltypes <- unique(de$res$split_level)
+coi <- celltypes[grepl(pattern = '^CD8', x = celltypes)]
+top_markers <- filter(de$res, split_level %in% coi) %>%
+  filter(FDR < 0.05) %>%
+    group_by(split_level, sign(logFC)) %>% 
+    filter(rank(FDR, ties.method = "first") <= 30)
+
+goi <- unique(top_markers$gene)
+
+df <- melt(t(as.matrix(s$RNA@counts[goi, ])), 
+           varnames = c('cell', 'gene'), 
+           value.name = 'count') %>% 
+  left_join(tibble::rownames_to_column(s@meta.data, var = 'cell'), by = 'cell') %>%
+  filter(!is.na(az.annot.for.de)) %>%
+  filter(az.annot.for.de %in% coi) %>%
+  group_by(genotype, orig.ident, az.annot.for.de, gene) %>%
+  summarise(logCPM = log(sum(count) / sum(nCount_RNA) * 1e6 + 1)) %>%
+  group_by(gene) %>% 
+  mutate(expr_scaled = scales::oob_squish(x = scale(logCPM)[, 1], range = c(-3, 3)))
+levels(df$genotype) <- c('M', 'WT')[grepl('WT', levels(df$genotype)) + 1]
+
+mat <- acast(df, gene ~ az.annot.for.de + orig.ident, value.var = 'expr_scaled')
+tmp <- hclust(dist(mat, method = 'manhattan'), method = 'ward.D2')
+```
+
+```{r, fig.width=10, out.width='100%', fig.height=6}
+df <- melt(t(as.matrix(s$SCT@counts[goi, ])), 
+           varnames = c('cell', 'gene'), 
+           value.name = 'expr') %>% 
+  left_join(tibble::rownames_to_column(s@meta.data, var = 'cell'), by = 'cell') %>%
+  filter(!is.na(az.annot.for.de)) %>%
+  filter(az.annot.for.de %in% coi) %>%
+  group_by(gene) %>% 
+  mutate(log_expr = log(expr + 1), 
+         expr_scaled = scales::oob_squish(x = scale(log(expr + 1))[, 1], range = c(-2, 2)))
+levels(df$genotype) <- c('Mutant', 'WT')[grepl('WT', levels(df$genotype)) + 1]
+df$genotype <- factor(as.character(df$genotype), levels = c('WT', 'Mutant'), ordered = TRUE)
+
+df <- arrange(df, gene, az.annot.for.de, genotype, orig.ident)
+df$cell <- factor(df$cell, levels = unique(df$cell))
+
+mat <- acast(df, gene ~ cell, value.var = 'expr_scaled')
+mat <- mat[rev(tmp$labels[tmp$order]), ]
+ph_df <- filter(df, gene == rownames(mat)[1]) %>% 
+  tibble::column_to_rownames(var = 'cell') %>%
+  select(genotype, az.annot.for.de) %>%
+  dplyr::rename(celltype = az.annot.for.de)
+unique_celltypes <- unique(ph_df$celltype)
+ann_colors <- list(
+  celltype = hcl.colors(n = length(unique_celltypes), palette = 'Temps'),
+  genotype = genotype_cols
+)
+names(ann_colors$celltype) <- unique_celltypes
+names(ann_colors$genotype) <- c('WT', 'Mutant')
+p1 <- pheatmap::pheatmap(mat, cluster_rows = FALSE, cluster_cols = FALSE, show_colnames = FALSE, 
+                   color = colorRampPalette(colors = c('#282e58', 'white', '#b0403d'))(11),
+                   annotation_col = ph_df, annotation_colors = ann_colors)
+p2 <- pheatmap::pheatmap(mat, cluster_rows = FALSE, cluster_cols = FALSE, show_colnames = FALSE, 
+                   color = hcl.colors(n = 11, palette = 'Cividis'),
+                   annotation_col = ph_df, annotation_colors = ann_colors)
+```
+
+```{r}
+cairo_pdf(filename = file.path(config$out_root, '06_NFATc1_cd8_single_cell_de_v1.pdf'), width = 8, height = 6)
+grid::grid.newpage()
+grid::grid.draw(p1$gtable)
+dev.off()
+```
+
+```{r}
+cairo_pdf(filename = file.path(config$out_root, '06_NFATc1_cd8_single_cell_de_v2.pdf'), width = 8, height = 6)
+grid::grid.newpage()
+grid::grid.draw(p2$gtable)
+dev.off()
+```
+
+
+
+
+# Runtime and session info
+
+Runtime: `r time_diff(start_time)`
+
+Session Info
+```{r}
+sessionInfo()
+```

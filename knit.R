@@ -5,16 +5,42 @@
 config <- yaml::read_yaml("config.yaml")
 report_dir <- file.path(config$out_root)
 
-# example 1: knit one specific file
-rmarkdown::render(input = 'Rmd/example.Rmd',
+rmarkdown::render(input = file.path(config$project_root, 'Rmd', '01_initial_look.rmd'),
                   output_dir = report_dir,
                   knit_root_dir = config$project_root,
                   envir = new.env())
 
-# example 2: knit one specific file and pass parameters
-rmarkdown::render(input = 'Rmd/example_with_parameters.Rmd',
+rmarkdown::render(input = file.path(config$project_root, 'Rmd', '02_integration.rmd'),
                   output_dir = report_dir,
                   knit_root_dir = config$project_root,
-                  envir = new.env(),
-                  params = list(mean = 100, sd = 100),
-                  output_file = 'example_with_parameters_100_100')
+                  envir = new.env())
+
+rmarkdown::render(input = file.path(config$project_root, 'Rmd', '03_azimuth_annotation.rmd'),
+                  output_dir = report_dir,
+                  knit_root_dir = config$project_root,
+                  envir = new.env())
+
+rmarkdown::render(input = file.path(config$project_root, 'Rmd', '04_clonotypes.rmd'),
+                  output_dir = report_dir,
+                  knit_root_dir = config$project_root,
+                  envir = new.env())
+
+rmarkdown::render(input = file.path(config$project_root, 'Rmd', '05_DE_edgeR.rmd'),
+                  output_dir = report_dir,
+                  knit_root_dir = config$project_root,
+                  envir = new.env())
+
+rmarkdown::render(input = file.path(config$project_root, 'Rmd', '06_make_figures.rmd'),
+                  output_dir = report_dir,
+                  knit_root_dir = config$project_root,
+                  envir = new.env())
+
+rmarkdown::render(input = file.path(config$project_root, 'Rmd', '07_b_cell_analysis.rmd'),
+                  output_dir = report_dir,
+                  knit_root_dir = config$project_root,
+                  envir = new.env())
+
+rmarkdown::render(input = file.path(config$project_root, 'Rmd', '08_GSEA_with_selected_gene_sets.rmd'),
+                  output_dir = report_dir,
+                  knit_root_dir = config$project_root,
+                  envir = new.env())

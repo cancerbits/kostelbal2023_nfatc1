@@ -1,0 +1,568 @@
+---
+title: 'Immune profiling analysis'
+author: 'Christoph Hafemeister'
+date: '`r format(Sys.time(), "%B %d, %Y %H:%M:%S %Z")`'
+output:
+  html_document:
+    toc: TRUE
+    toc_depth: 2
+    toc_float: TRUE
+    code_folding: "hide"
+params:
+  config_file: "config.yaml"
+---
+
+```{r}
+# load project-specific parameters
+config <- yaml::read_yaml(params$config_file)
+
+suppressPackageStartupMessages({
+  library('Matrix')
+  library('dplyr')
+  library('Seurat')
+  library('sctransform')
+  library('reshape2')
+  library('ggplot2')
+  library('patchwork')
+  library('ggrepel')
+  source(file.path(config$project_root, 'R', 'utils.r'))
+})
+
+#future::plan(strategy = "multiprocess", workers = 1)
+#options(future.globals.maxSize = 8 * 1024 ^ 3)
+#options(future.fork.enable = TRUE)
+
+knitr::opts_chunk$set(comment = NA, fig.width = 5, fig.height = 3.5, out.width = '60%',
+                      warning = TRUE, error = TRUE, echo = TRUE, message = TRUE,
+                      dpi = 100)
+options(dplyr.summarise.inform = FALSE)
+options(tibble.width = Inf)
+options(DT.options = list(paging = TRUE, searching = FALSE, autoWidth = TRUE))
+
+old <- theme_set(theme_bw(base_size = 11))
+set.seed(8569205)
+start_time <- proc.time()['elapsed']
+```
+
+# Load scRNA-seq results
+```{r}
+# load results of cell type annotation and join with clonotype summary
+s_md <- readRDS(file = file.path(config$out_root, '03_integrated_NFATc1_annotated_meta_data.rds'))
+s_md$barcode <- rownames(s_md)
+```
+
+
+# Immune profiling analysis
+
+## Read data; first overview
+
+Read clonotype contig annotations into one big data frame and print table of Sample ID vs Chain detected. Note that we keep only observations with productive contig (likely functional T or B cell receptor) and annotated with a single chain (discarding 'Multi' chains that we see in gdTCR results quite often)
+```{r}
+path = config$data_root
+clonotype_files <- list.files(path = path, pattern = '^filtered_contig_annotations\\.csv$', recursive = TRUE, full.names = TRUE)
+ret <- list()
+for (f in clonotype_files) {
+  clono_dat <- read.csv(f)
+  clono_dat$dir_name <- basename(dirname(f))
+  # also read the clonotype file, so we can add the iNKT and MAIT evidence
+  clono_anno <- read.csv(file = gsub(pattern = 'filtered_contig_annotations\\.csv$', 
+                                     x = f,
+                                     replacement = 'clonotypes.csv'))
+  if (all(c('clonotype_id', 'inkt_evidence', 'mait_evidence') %in% colnames(clono_anno))) {
+    clono_dat <- left_join(clono_dat, clono_anno[, c('clonotype_id', 'inkt_evidence', 'mait_evidence')], by = c('raw_clonotype_id' = 'clonotype_id'))
+  } else {
+    clono_dat$inkt_evidence <- ''
+    clono_dat$mait_evidence <- ''
+  }
+  
+  ret[[basename(dirname(f))]] <- clono_dat
+}
+clono_dat <- do.call(rbind, ret)
+clono_dat <- do.call(rbind, ret) %>% filter(productive %in% c('true', 'True'), chain != 'Multi')
+```
+
+Table of directory name and chain
+```{r}
+print(table(clono_dat$dir_name, clono_dat$chain))
+```
+
+Infer sample IDs from directory names and show sample-chain table
+```{r}
+# infer sample ids from directory names
+clono_dat$sample_id <- gsub(pattern = '_(abTCR|BCR|gdTCR)_VDJ(_GD)*', replacement = '', x = clono_dat$dir_name)
+print(table(clono_dat$sample_id, clono_dat$chain))
+
+clono_dat$sample_number <- as.integer(stringr::str_extract(clono_dat$sample_id, '\\d+'))
+# make sure the cell barcode matches the names assigned by Seurat in the merged and integrated analysis
+clono_dat$barcode <- paste(clono_dat$barcode, clono_dat$sample_number, sep = '_')
+```
+Keep only the relevant samples
+```{r}
+clono_dat <- clono_dat[clono_dat$sample_id %in% s_md$orig.ident, ]
+```
+
+
+Aggregate the chain counts per cell. How often do we see certain chains together (and how many of them)?
+```{r}
+chain_counts <- arrange(clono_dat, sample_id, barcode, chain) %>%
+  group_by(sample_id, barcode, chain) %>% 
+  summarise(n = n()) %>%
+  mutate(chain_count = paste(chain, n, sep=':')) %>%
+  summarise(chains = paste(chain_count, collapse = ';'))
+tab <- as.data.frame(sort(table(chain_counts$chains), decreasing = TRUE))
+colnames(tab) <- c('Chain counts', 'Cells')
+DT::datatable(tab)
+```
+
+
+```{r}
+# combine the information per cell; use only data with productive CDR3
+clono_sum <- arrange(clono_dat, sample_id, barcode, chain) %>%
+  group_by(sample_id, barcode) %>% 
+  mutate(chain_cdr3 = paste(chain, cdr3, sep=':')) %>%
+  summarise(clonotype = paste(chain_cdr3, collapse = ';'),
+            inkt_evidence = paste(setdiff(sort(unique(inkt_evidence)), ''), collapse = ';'),
+            mait_evidence = paste(setdiff(sort(unique(mait_evidence)), ''), collapse = ';')) %>%
+  mutate(has_TRAB = grepl(pattern = 'TR[AB]:', x = clonotype),
+         has_IG = grepl(pattern = 'IG[HKL]:', x = clonotype),
+         has_TRDG = grepl(pattern = 'TR[DG]:', x = clonotype),
+         only_TRAB = has_TRAB & !has_IG & !has_TRDG,
+         only_IG = !has_TRAB & has_IG & !has_TRDG,
+         only_TRDG = !has_TRAB & !has_IG & has_TRDG)
+
+freq_ab <- filter(clono_sum, has_TRAB) %>%
+  group_by(sample_id, clonotype) %>%
+  summarise(n = n()) %>%
+  mutate(freq = n / sum(n), rank = rank(-freq, ties.method = 'min')) %>% 
+  arrange(sample_id, -freq)
+
+freq_ig <- filter(clono_sum, has_IG) %>%
+  group_by(sample_id, clonotype) %>%
+  summarise(n = n()) %>%
+  mutate(freq = n / sum(n), rank = rank(-freq, ties.method = 'min')) %>% 
+  arrange(sample_id, -freq)
+
+freq_dg <- filter(clono_sum, has_TRDG) %>%
+  group_by(sample_id, clonotype) %>%
+  summarise(n = n()) %>%
+  mutate(freq = n / sum(n), rank = rank(-freq, ties.method = 'min')) %>% 
+  arrange(sample_id, -freq)
+
+# join with scRNA-seq results
+s_md <- left_join(s_md, clono_sum, by = 'barcode')
+pred_cell_types <- sort(unique(as.character(s_md$az.annotation)))
+s_md$az.annotation <- factor(s_md$az.annotation, levels = pred_cell_types)
+s_md <- left_join(s_md, chain_counts)
+```
+
+Save for later
+```{r}
+saveRDS(object = list(clono_dat = clono_dat, 
+                      clono_sum = clono_sum,
+                      md = s_md), 
+        file = file.path(config$out_root, '04_clonotypes_NFATc1.rds'))
+```
+
+
+## TRA and TRB 
+
+```{r, fig.width=10, fig.height=4.5, out.width='100%'}
+p1 <- filter(s_md, has_TRAB) %>%
+  ggplot(aes(sample_id, fill = chains)) + geom_bar() + ylab('Cells') +
+  ggtitle('Cells with at least one A or B chain') +
+  scale_fill_discrete(name = 'Chain counts') +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+show(p1)
+```
+
+Clonotype diversity based on cells with exactly one A and one B chains observed
+```{r}
+tmp <- filter(s_md, chains == 'TRA:1;TRB:1') %>%
+  group_by(sample_id) %>%
+  summarise(n = n(), sdi(clonotype))
+p2 <- ggplot(tmp, aes(n, exp(sdi))) + 
+  geom_abline(slope = 1, color = 'gray80') +
+  geom_point() +
+  geom_label_repel(aes(label = sample_id), max.overlaps = Inf) +
+  xlab('Cells') + ylab('Effective number of clonotypes') 
+show(p2)
+
+tmp <- filter(s_md, chains == 'TRA:1;TRB:1') %>%
+  group_by(sample_id) %>%
+  summarise(sdi_ds = sdi_ds(clonotype))
+p3 <- ggplot(tmp, aes(sample_id, sdi_ds)) + geom_boxplot() +
+  ylab('Shannon diversity index') +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+p4 <- ggplot(tmp, aes(sample_id, exp(sdi_ds))) + geom_boxplot() +
+  ylab('Effective number of clonotypes') +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+show((p3 + p4) + plot_annotation(title = 'Downsampled to 100 cells, 1000 bootstraps'))
+```
+
+
+Show only clonotypes that have been ranked in the top 5 and have been observed more than two times
+```{r, fig.width=10, out.width='100%'}
+top_clono <- filter(freq_ab, rank <= 5, n > 2) %>% pull(clonotype) %>% unique()
+filter(freq_ab, clonotype %in% top_clono) %>% 
+  DT::datatable(rownames = FALSE) %>% 
+  DT::formatRound(columns = 'freq', digits = 3)
+```
+```{r, out.width='100%', fig.width=10, fig.height=7}
+p2 <- filter(freq_ab, clonotype %in% top_clono) %>% ungroup() %>%
+  mutate(sample_id = factor(sample_id, levels = rev(unique(sample_id))),
+         clonotype = factor(clonotype, levels = unique(clonotype))) %>%
+  ggplot(aes(clonotype, sample_id, fill = freq)) +
+  geom_raster() +
+  scale_fill_continuous(name = 'Frequency') +
+  theme(axis.text.x = element_text(angle = 66, hjust = 1)) +
+  ggtitle('Clonotype frequency heatmap')
+show(p2)
+```
+
+#### Clonality
+
+As an additional clonotype diversity measure, we calculate clonality (one minus normalized entropy, aka one minus Peilou’s evenness index).
+
+This is based on all cells with clonotype information regardless of whether they are in the RNA-seq based analysis.
+
+Use only TCRB, ignore other chains, use only cells with exactly one TCRB chain.
+
+```{r, fig.width=10, out.width='100%', fig.height=3.5}
+df <- mutate(clono_sum, n_TRB = stringr::str_count(string = clonotype, pattern = 'TRB:')) %>%
+  filter(n_TRB == 1) %>%
+  mutate(TRB = stringr::str_extract(string = clonotype, pattern = 'TRB:[A-Z]+')) %>%
+  group_by(sample_id) %>%
+  summarise(cells = n(), clonotypes = length(unique(TRB)), clonality = 1 - norm_entropy(TRB))
+p1 <- ggplot(df, aes(sample_id, clonality)) + geom_bar(stat = 'identity') + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  xlab('Sample') + ylab('Clonality')
+p2 <- gridExtra::tableGrob(df, rows = NULL)
+show((p1 + p2) + plot_annotation(title = 'Clonality (TCRB) using all cells with one TCRB chain'))
+```
+
+
+Use both TCRA and TCRB chains to define clonotype, use only cells with exactly one TCRA chain and one TCRB chain, ignore other chains.
+
+```{r, fig.width=10, out.width='100%', fig.height=3.5}
+df <- mutate(clono_sum, 
+             n_TRB = stringr::str_count(string = clonotype, pattern = 'TRB:'),
+             n_TRA = stringr::str_count(string = clonotype, pattern = 'TRA:')) %>%
+  filter(n_TRB == 1, n_TRA == 1) %>%
+  mutate(AB = paste(stringr::str_extract(string = clonotype, pattern = 'TRA:[A-Z]+'),
+                    stringr::str_extract(string = clonotype, pattern = 'TRB:[A-Z]+'))) %>%
+  group_by(sample_id) %>%
+  summarise(cells = n(), clonotypes = length(unique(AB)), clonality = 1 - norm_entropy(AB))
+p1 <- ggplot(df, aes(sample_id, clonality)) + geom_bar(stat = 'identity') + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  xlab('Sample') + ylab('Clonality')
+p2 <- gridExtra::tableGrob(df, rows = NULL)
+show((p1 + p2) + plot_annotation(title = 'Clonality (A+B) using all cells with exactly one TCRA and TCRB chain and RNA-seq'))
+```
+
+Clonality per integration cluster
+
+Cells used: Cells that are in RNA-seq data and have exactly one TRB chain
+Clonotype definition: AA sequence of TRB
+
+```{r, fig.width=8, out.width='80%', fig.height=5}
+df <- filter(s_md, grepl('TRB:1', chains)) %>%
+  mutate(TRB = stringr::str_extract(string = clonotype, pattern = 'TRB:[A-Z]+')) %>%
+  group_by(sample_id, integration_cluster) %>%
+  summarise(cells = n(), clonotypes = length(unique(TRB)), clonality = 1 - norm_entropy(TRB))
+
+filter(df, cells > 9) %>%
+  ggplot(aes(sample_id, clonality, size = cells)) + geom_point() +
+  facet_wrap(~ integration_cluster, ncol = 5) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position="bottom") +
+  xlab('Sample ID') + ylab('Clonality') +
+  ggtitle('Clonality per cluster (10 or more cells) per sample (TCRB only)')
+```
+
+Clonality per cell type (unfiltered Azimuth predictions)
+
+Cells used: Cells that are in RNA-seq data and have exactly one TRB chain
+Clonotype definition: AA sequence of TRB
+
+```{r, fig.width=8, out.width='80%', fig.height=5}
+df <- filter(s_md, grepl('TRB:1', chains)) %>%
+  dplyr::rename(celltype = az.annotation) %>%
+  mutate(TRB = stringr::str_extract(string = clonotype, pattern = 'TRB:[A-Z]+')) %>%
+  group_by(sample_id, celltype) %>%
+  summarise(cells = n(), clonotypes = length(unique(TRB)), clonality = 1 - norm_entropy(TRB))
+
+filter(df, cells > 9) %>%
+  ggplot(aes(sample_id, clonality, size = cells)) + geom_point() +
+  facet_wrap(~ celltype, ncol = 5) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position="bottom") +
+  xlab('Sample ID') + ylab('Clonality') +
+  ggtitle('Clonality per cell type (10 or more cells) per sample (TCRB only)')
+```
+
+Clonality per cell type (filtered Azimuth predictions)
+
+Cells used: Cells that are in RNA-seq data and have exactly one TRB chain
+Clonotype definition: AA sequence of TRB
+
+```{r, fig.width=8, out.width='80%', fig.height=5}
+df <- filter(s_md, grepl('TRB:1', chains), !is.na(az.annot.filtered)) %>%
+  dplyr::rename(celltype = az.annot.filtered) %>%
+  mutate(TRB = stringr::str_extract(string = clonotype, pattern = 'TRB:[A-Z]+')) %>%
+  group_by(sample_id, celltype) %>%
+  summarise(cells = n(), clonotypes = length(unique(TRB)), clonality = 1 - norm_entropy(TRB))
+
+filter(df, cells > 9) %>%
+  ggplot(aes(sample_id, clonality, size = cells)) + geom_point() +
+  facet_wrap(~ celltype, ncol = 5) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position="bottom") +
+  xlab('Sample ID') + ylab('Clonality') +
+  ggtitle('Clonality per cell type (10 or more cells) per sample (TCRB only)')
+```
+
+### Enrichment in clusters / cell types {.tabset}
+
+#### Clusters
+
+Check enrichment in clusters
+```{r}
+coi <- filter(s_md, !is.na(clonotype), has_TRAB) %>%
+  group_by(clonotype) %>%
+  summarise(n = n()) %>%
+  filter(n > 1) %>%
+  pull(clonotype)
+enrich_res <- filter(s_md, !is.na(clonotype) & clonotype %in% coi) %>% 
+  group_by(orig.ident, clonotype, integration_cluster, .drop = FALSE) %>%
+  summarise(enrich_test(x_val = clonotype[1], 
+                        y_val = integration_cluster[1], 
+                        x_vec = s_md$clonotype[s_md$orig.ident == orig.ident[1]], 
+                        y_vec = s_md$integration_cluster[s_md$orig.ident == orig.ident[1]])) %>%
+  ungroup()
+enrich_sum <- mutate(enrich_res, p_val_adjust = p.adjust(p_val)) %>%
+  filter(p_val_adjust <= 0.05) %>%
+  arrange(p_val_adjust)
+
+DT::datatable(data = enrich_sum, rownames = FALSE) %>% 
+  DT::formatRound(columns = c('odds_ratio'), digits = 3) %>%
+  DT::formatSignif(columns = c('p_val', 'p_val_adjust'))
+```
+
+Heatmap of odds ratio for the top clonotypes. Shown are log2-odds-ratios limited to the range -5, 5.
+```{r, fig.width=12, fig.height=7, out.width='100%'}
+selected_ct <- filter(enrich_sum, rank(p_val_adjust) <= 30) %>%
+  pull(clonotype) %>% unique()
+odds_mat <- filter(enrich_res, clonotype %in% selected_ct) %>%
+  mutate(log_odds_ratio = log2(scales::oob_squish_any(x = odds_ratio, range = c(1/32, 32))),
+         clonotype = paste0(stringr::str_match(orig.ident, 'KB\\d+_'), clonotype)) %>%
+  acast(formula = clonotype ~ integration_cluster, value.var = 'log_odds_ratio')
+gplots::heatmap.2(odds_mat, scale = 'none', trace = 'none', margins = c(3,35), 
+                  col = RColorBrewer::brewer.pal(n = 11, name = 'RdYlGn'))
+```
+
+In which clusters do we see enrichment most often?
+```{r}
+sort(table(enrich_sum$integration_cluster), decreasing = TRUE)
+```
+
+#### Azimuth cell types
+
+Check Azimuth predicted cell types for clonotype enrichment
+```{r}
+enrich_res <- filter(s_md, !is.na(clonotype) & clonotype %in% coi) %>% 
+  group_by(orig.ident, clonotype, az.annotation, .drop = FALSE) %>%
+  summarise(enrich_test(x_val = clonotype[1], 
+                        y_val = az.annotation[1], 
+                        x_vec = s_md$clonotype[s_md$orig.ident == orig.ident[1]], 
+                        y_vec = s_md$az.annotation[s_md$orig.ident == orig.ident[1]])) %>%
+  ungroup()
+enrich_sum <- mutate(enrich_res, p_val_adjust = p.adjust(p_val)) %>%
+  filter(p_val_adjust <= 0.05) %>%
+  arrange(p_val_adjust)
+
+DT::datatable(data = enrich_sum, rownames = FALSE) %>% 
+  DT::formatRound(columns = c('odds_ratio'), digits = 3) %>%
+  DT::formatSignif(columns = c('p_val', 'p_val_adjust'))
+```
+
+Heatmap of odds ratio for the top clonotypes. Shown are log2-odds-ratios limited to the range -5, 5.
+```{r, fig.width=12, fig.height=7, out.width='100%'}
+selected_ct <- filter(enrich_sum, rank(p_val_adjust) <= 30) %>%
+  pull(clonotype) %>% unique()
+odds_mat <- filter(enrich_res, clonotype %in% selected_ct) %>%
+  mutate(log_odds_ratio = log2(scales::oob_squish_any(x = odds_ratio, range = c(1/32, 32))),
+         clonotype = paste0(stringr::str_match(orig.ident, 'KB\\d+_'), clonotype)) %>%
+  acast(formula = clonotype ~ az.annotation, value.var = 'log_odds_ratio')
+gplots::heatmap.2(odds_mat, scale = 'none', trace = 'none', margins = c(8,25), 
+                  cexRow = 1, cexCol = 0.9,
+                  col = RColorBrewer::brewer.pal(n = 11, name = 'RdYlGn'))
+```
+
+In which cell types do we see enrichment most often?
+```{r}
+sort(table(enrich_sum$az.annotation), decreasing = TRUE)
+```
+
+
+
+### In context of predicted cell types
+
+Tables below show the predicted cell type and whether the cell is annotated with at least one A or B chain and no other chains. Values of NA mean no celltype or clonotype annotation is available.
+
+```{r}
+table(s_md$az.annotation, s_md$only_TRAB, useNA = 'always')
+```
+
+Show how the top clonotypes are distributed among the predicted cell types
+
+```{r}
+tmp <- filter(s_md, clonotype %in% top_clono) %>%
+  group_by(az.annotation, clonotype) %>%
+  summarise(n = n()) %>%
+  acast(formula = az.annotation ~ clonotype, value.var = 'n')
+print(t(tmp))
+```
+
+
+## TRD and TRG
+
+```{r, fig.width=10, fig.height=4.5, out.width='100%'}
+p1 <- filter(s_md, has_TRDG) %>%
+  ggplot(aes(sample_id, fill = chains)) + geom_bar() + ylab('Cells') +
+  ggtitle('Cells with at least one D or G chain') +
+  scale_fill_discrete(name = 'Chain counts') +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+show(p1)
+```
+
+Clonotype diversity based on cells with exactly one D and one G chains observed
+```{r}
+tmp <- filter(s_md, chains == 'TRD:1;TRG:1') %>%
+  group_by(sample_id) %>%
+  summarise(n = n(), sdi(clonotype))
+p2 <- ggplot(tmp, aes(n, exp(sdi))) + 
+  geom_abline(slope = 1, color = 'gray80') +
+  geom_point() +
+  geom_label_repel(aes(label = sample_id), max.overlaps = Inf) +
+  xlab('Cells') + ylab('Effective number of clonotypes') 
+show(p2)
+```
+
+Show  clonotypes that have been ranked in the top 5 and have been observed more than two times
+```{r, fig.width=10, out.width='100%'}
+top_clono <- filter(freq_dg, rank <= 5, n > 2) %>% pull(clonotype) %>% unique()
+filter(freq_dg, clonotype %in% top_clono) %>% 
+  DT::datatable(rownames = FALSE) %>% DT::formatRound(columns = 'freq', digits = 3)
+```
+```{r, out.width='100%', fig.width=10, fig.height=7}
+p2 <- filter(freq_dg, clonotype %in% top_clono) %>% ungroup() %>%
+  mutate(sample_id = factor(sample_id, levels = rev(unique(sample_id))),
+         clonotype = factor(clonotype, levels = unique(clonotype))) %>%
+  ggplot(aes(clonotype, sample_id, fill = freq)) +
+  geom_raster() +
+  scale_fill_continuous(name = 'Frequency') +
+  theme(axis.text.x = element_text(angle = 66, hjust = 1)) +
+  ggtitle('Clonotype frequency heatmap')
+show(p2)
+```
+
+### In context of predicted cell types 
+
+Tables below show the predicted cell type and whether the cell is annotated with at least one D or G chain and no other chains. Values of NA mean no celltype or clonotype annotation is available.
+
+```{r}
+table(s_md$az.annotation, s_md$only_TRDG, useNA = 'always')
+```
+
+Show how the top clonotypes are distributed among the predicted cell types
+
+```{r}
+tmp <- filter(s_md, clonotype %in% top_clono) %>%
+  group_by(az.annotation, clonotype) %>%
+  summarise(n = n()) %>%
+  acast(formula = az.annotation ~ clonotype, value.var = 'n')
+print(t(tmp))
+```
+
+
+## IGH, IGK and IGL
+
+```{r, fig.width=10, fig.height=4.5, out.width='100%'}
+p1 <- filter(s_md, has_IG) %>%
+  ggplot(aes(sample_id, fill = chains)) + geom_bar() + ylab('Cells') +
+  ggtitle('Cells with at least one H, K, or L chain') +
+  scale_fill_discrete(name = 'Chain counts') +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+show(p1)
+```
+
+Show only clonotypes that have been ranked in the top 5 and have been observed more than one time
+```{r}
+top_clono <- filter(freq_ig, rank <= 5, n > 1) %>% pull(clonotype) %>% unique()
+filter(freq_ig, clonotype %in% top_clono) %>% 
+  DT::datatable(rownames = FALSE) %>% DT::formatRound(columns = 'freq', digits = 3)
+```
+```{r, out.width='100%', fig.width=10, fig.height=7}
+p2 <- filter(freq_ig, clonotype %in% top_clono) %>% ungroup() %>%
+  mutate(sample_id = factor(sample_id, levels = rev(unique(sample_id))),
+         clonotype = factor(clonotype, levels = unique(clonotype))) %>%
+  ggplot(aes(clonotype, sample_id, fill = freq)) +
+  geom_raster() +
+  scale_fill_continuous(name = 'Frequency') +
+  theme(axis.text.x = element_text(angle = 66, hjust = 1))
+show(p2)
+```
+
+### In context of predicted cell types
+
+Tables below show the predicted cell type and whether the cell is annotated with at least one H, K or L chain and no other chains. Values of NA mean no celltype or clonotype annotation is available.
+
+```{r}
+table(s_md$az.annotation, s_md$only_IG, useNA = 'always')
+```
+
+Show how the top clonotypes are distributed among the predicted cell types
+
+```{r}
+tmp <- filter(s_md, clonotype %in% top_clono) %>%
+  group_by(az.annotation, clonotype) %>%
+  summarise(n = n()) %>%
+  acast(formula = az.annotation ~ clonotype, value.var = 'n')
+print(t(tmp))
+```
+
+
+## iNKT and MAIT cells
+
+> Cell Ranger labels cells as potential iNKT and MAIT cells based on a combination of 1) matching the appropriate V and J genes for the TCR alpha, 2) matching the appropriate V genes for the TCR beta, and 3) matching known V(D)J junctions (CDR3s) from the literature.
+
+### iNKT evidence in context of predicted cell types 
+
+Tables below show the predicted cell type and whether the cell has evidence of being iNKT
+
+```{r}
+table(s_md$az.annotation, s_md$inkt_evidence, useNA = 'always')
+```
+
+### MAIT evidence in context of predicted cell types 
+
+Tables below show the predicted cell type and whether the cell has evidence of being MAIT
+
+```{r}
+table(s_md$az.annotation, s_md$mait_evidence, useNA = 'always')
+```
+
+## References
+
+[10x immune profiling glossary](https://support.10xgenomics.com/single-cell-vdj/software/pipelines/latest/algorithms/glossary)
+
+[10x immune profiling annotation algorithm](https://support.10xgenomics.com/single-cell-vdj/software/pipelines/latest/algorithms/annotation#cdr3)
+
+[10x iNKT and MAIT annotation](https://support.10xgenomics.com/single-cell-vdj/software/pipelines/latest/algorithms/single-cell-vdj/software/pipelines/latest/algorithms/inkt-mait)
+
+## Runtime and session info
+
+Runtime: `r time_diff(start_time)`
+
+Session Info
+```{r}
+sessionInfo()
+```

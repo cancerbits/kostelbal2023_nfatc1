@@ -1,0 +1,319 @@
+---
+title: 'GSEA with selected gene sets'
+author: 'Christoph Hafemeister'
+date: '`r format(Sys.time(), "%B %d, %Y %H:%M:%S %Z")`'
+output:
+  html_document:
+    toc: TRUE
+    toc_depth: 3
+    toc_float: TRUE
+    code_folding: "hide"
+params:
+  config_file: "config.yaml"
+---
+
+# Setup
+
+```{r}
+# load project-specific parameters
+config <- yaml::read_yaml(params$config_file)
+
+suppressPackageStartupMessages({
+  library('Matrix')
+  library('dplyr')
+  library('Seurat')
+  library('sctransform')
+  library('reshape2')
+  library('ggplot2')
+  library('patchwork')
+  library('ggrepel')
+  source(file.path(config$project_root, 'R', 'utils.r'))
+})
+
+#future::plan(strategy = "multiprocess", workers = 1)
+#options(future.globals.maxSize = 8 * 1024 ^ 3)
+#options(future.fork.enable = TRUE)
+
+#remotes::install_github(repo = 'cancerbits/canceRbits', ref = '8f154d6')
+
+knitr::opts_chunk$set(comment = NA, fig.width = 5, fig.height = 3.5, out.width = '60%',
+                      warning = TRUE, error = TRUE, echo = TRUE, message = TRUE,
+                      dpi = 100)
+options(dplyr.summarise.inform = FALSE)
+options(tibble.width = Inf)
+options(DT.options = list(paging = TRUE, searching = TRUE, autoWidth = TRUE))
+options(ggrepel.max.overlaps = Inf)
+
+old <- theme_set(theme_bw(base_size = 11))
+set.seed(8569205)
+start_time <- proc.time()['elapsed']
+```
+
+# Read the gene sets
+
+First the ones that we have in our local copy of enrichr
+```{r}
+pathways <- list(
+  'BioPlanet_2019.tsv' = 'T cell receptor calcium pathway',
+  'KEGG_2021_Human.tsv' = 'Calcium signaling pathway',
+  'NCI-Nature_2016.tsv' = 'Calcium signaling in the CD4+ TCR pathway Homo sapiens 5294f70b-618f-11e5-8ac5-06603eb7f303',
+  'WikiPathway_2021_Human.tsv' = c('Electron Transport Chain (OXPHOS system in mitochondria) WP111', 
+                                   'Glycolysis in senescence WP5049', 
+                                   'HIF1A and PPARG regulation of glycolysis WP2456',
+                                   'Fatty acid beta-oxidation WP143',
+                                   'Fatty acid transporters WP5061'),
+  'Reactome_2022.tsv' = c('Glycolysis R-HSA-70171',
+                          'Mitochondrial Fatty Acid Beta-Oxidation Of Saturated Fatty Acids R-HSA-77286',
+                          'Mitochondrial Fatty Acid Beta-Oxidation Of Unsaturated Fatty Acids R-HSA-77288',
+                          'Fatty Acid Metabolism R-HSA-8978868'),
+  'MSigDB_Hallmark_2020.tsv' = c('Glycolysis', 'Fatty Acid Metabolism') 
+)
+
+genesets <- lapply(names(pathways), function(f) {
+  canceRbits::cb_enrichr_gsets(filepath = file.path(config$enrichr_lib, f))[pathways[[f]]]
+})
+genesets <- unlist(genesets, recursive = FALSE)
+```
+
+Then the ones we defined.
+```{r}
+genesets[['Exhaustion']] <- readr::read_tsv(file = file.path(config$project_root, 'metadata', 'gene_set_exhaustion.tsv'), col_names = FALSE, show_col_types = FALSE)$X1
+
+genesets[['Exhaustion and or anergy']] <- readr::read_tsv(file = file.path(config$project_root, 'metadata', 'gene_set_exhaustion_and_or_anergy.tsv'), col_names = FALSE, show_col_types = FALSE)$X1
+
+print(genesets)
+```
+
+## GSEA per integration cluster
+
+```{r}
+filename <- '05_DE_edgeR_per_cluster_mutant_vs_wildtype.csv'
+de <- list()
+de$res <- readr::read_csv2(file = file.path(config$out_root, filename), show_col_types = FALSE)
+de$res$split_level <- de$res$integration_cluster
+```
+
+## {.tabset}
+
+Enrichment analysis
+
+### DE genes higher in mutant
+```{r}
+# for the genes higher in mutant
+hyper_res <- group_by(de$res, split_level) %>%
+  mutate(is_de = FDR < 0.05 & logFC < 0) %>%
+  summarise(run_hyper(genes = gene[is_de], background = gene, pathways = genesets, min_size = 3)) %>% 
+  rename(cluster = split_level, pathway = label, de_genes = signature) %>%
+  ungroup() %>%
+  mutate(fdr = p.adjust(pval, method = 'fdr')) %>%
+  #filter(fdr <= 0.1) %>%
+  arrange(fdr)
+
+select(hyper_res, cluster, pathway, fdr, de_genes, geneset, overlap, hits) %>%
+  DT::datatable(rownames = FALSE, caption = 'DE per cluster, higher in mutant') %>%
+  DT::formatSignif(columns = c('fdr'), digits = 3)
+
+```
+
+### DE genes higher in WT
+```{r}
+# for the genes higher in mutant
+hyper_res <- group_by(de$res, split_level) %>%
+  mutate(is_de = FDR < 0.05 & logFC > 0) %>%
+  summarise(run_hyper(genes = gene[is_de], background = gene, pathways = genesets, min_size = 3)) %>% 
+  rename(cluster = split_level, pathway = label, de_genes = signature) %>%
+  ungroup() %>%
+  mutate(fdr = p.adjust(pval, method = 'fdr')) %>%
+  #filter(fdr <= 0.1) %>%
+  arrange(fdr)
+
+select(hyper_res, cluster, pathway, fdr, de_genes, geneset, overlap, hits) %>%
+  DT::datatable(rownames = FALSE, caption = 'DE per cluster, higher in WT') %>%
+  DT::formatSignif(columns = c('fdr'), digits = 3)
+
+```
+
+## GSEA per cell type (filtered Azimuth predictions)
+
+```{r}
+filename <- '05_DE_edgeR_per_cell_type_mutant_vs_wildtype.csv'
+de <- list()
+de$res <- readr::read_csv2(file = file.path(config$out_root, filename))
+de$res$split_level <- de$res$cell_type
+```
+
+
+## {.tabset}
+
+Enrichment analysis
+
+### DE genes higher in mutant
+```{r}
+# for the genes higher in mutant
+hyper_res <- group_by(de$res, split_level) %>%
+  mutate(is_de = FDR < 0.05 & logFC < 0) %>%
+  summarise(run_hyper(genes = gene[is_de], background = gene, pathways = genesets, min_size = 3)) %>% 
+  rename(cell_type = split_level, pathway = label, de_genes = signature) %>%
+  ungroup() %>%
+  mutate(fdr = p.adjust(pval, method = 'fdr')) %>%
+  #filter(fdr <= 0.1) %>%
+  arrange(fdr)
+
+select(hyper_res, cell_type, pathway, fdr, de_genes, geneset, overlap, hits) %>%
+  DT::datatable(rownames = FALSE, caption = 'DE per cell type, higher in mutant') %>%
+  DT::formatSignif(columns = c('fdr'), digits = 3)
+
+```
+
+### DE genes higher in WT
+```{r}
+# for the genes higher in mutant
+hyper_res <- group_by(de$res, split_level) %>%
+  mutate(is_de = FDR < 0.05 & logFC > 0) %>%
+  summarise(run_hyper(genes = gene[is_de], background = gene, pathways = genesets, min_size = 3)) %>% 
+  rename(cell_type = split_level, pathway = label, de_genes = signature) %>%
+  ungroup() %>%
+  mutate(fdr = p.adjust(pval, method = 'fdr')) %>%
+  #filter(fdr <= 0.1) %>% 
+  arrange(fdr)
+
+select(hyper_res, cell_type, pathway, fdr, de_genes, geneset, overlap, hits) %>%
+  DT::datatable(rownames = FALSE, caption = 'DE per cell type, higher in WT') %>%
+  DT::formatSignif(columns = c('fdr'), digits = 3)
+
+```
+
+## GSEA per T cell compartment
+
+```{r}
+filename <- '05_DE_edgeR_per_tcell_type_mutant_vs_wildtype.csv'
+de <- list()
+de$res <- readr::read_csv2(file = file.path(config$out_root, filename))
+de$res$split_level <- de$res$cell_type
+```
+
+## {.tabset}
+
+Enrichment analysis
+
+### DE genes higher in mutant
+```{r}
+# for the genes higher in mutant
+hyper_res <- group_by(de$res, split_level) %>%
+  mutate(is_de = FDR < 0.05 & logFC < 0) %>%
+  summarise(run_hyper(genes = gene[is_de], background = gene, pathways = genesets, min_size = 3)) %>% 
+  rename(cell_type = split_level, pathway = label, de_genes = signature) %>%
+  ungroup() %>%
+  mutate(fdr = p.adjust(pval, method = 'fdr')) %>%
+  #filter(fdr <= 0.1) %>%
+  arrange(fdr)
+
+filter(hyper_res, fdr <= 1.1) %>%
+  select(cell_type, pathway, fdr, de_genes, geneset, overlap, hits) %>%
+  DT::datatable(rownames = FALSE, caption = 'DE per cell type, higher in mutant') %>%
+  DT::formatSignif(columns = c('fdr'), digits = 3)
+
+readr::write_excel_csv2(x = hyper_res, file = file.path(config$out_root, '08_DE_NFATc1_per_tcell_type_mutant_vs_wildtype_enrich_higher_in_mutant.csv'))
+```
+
+GSEA result figure
+
+```{r}
+filter(hyper_res, pathway == 'Exhaustion and or anergy')
+
+res_for_pdf <- filter(hyper_res, pathway == 'Exhaustion and or anergy') %>%
+  mutate(hits = stringr::str_replace_all(string = hits, pattern = ',', replacement = ', ')) %>%
+  select(-pathway, -fdr, -overlap) %>%
+  select(cell_type, pval, background, geneset, de_genes, hits) %>%
+  dplyr::rename('Cell Type' = 'cell_type', 'Hits' = 'hits', 'p-value' = 'pval', 'Tested genes' = 'background', 'DE genes' = 'de_genes', 'Pathway genes' = 'geneset')
+
+show(res_for_pdf)
+
+library('gridExtra')
+pdf(file = file.path(config$out_root, '08_GSEA_details.pdf'), height=1.1, width=8.2)
+grid.table(res_for_pdf, rows = NULL)
+dev.off()
+```
+
+### DE genes higher in WT
+```{r}
+# for the genes higher in mutant
+hyper_res <- group_by(de$res, split_level) %>%
+  mutate(is_de = FDR < 0.05 & logFC > 0) %>%
+  summarise(run_hyper(genes = gene[is_de], background = gene, pathways = genesets, min_size = 3)) %>% 
+  rename(cell_type = split_level, pathway = label, de_genes = signature) %>%
+  ungroup() %>%
+  mutate(fdr = p.adjust(pval, method = 'fdr')) %>%
+  #filter(fdr <= 0.1) %>% 
+  arrange(fdr)
+
+filter(hyper_res, fdr <= 1.1) %>%
+  select(cell_type, pathway, fdr, de_genes, geneset, overlap, hits) %>%
+  DT::datatable(rownames = FALSE, caption = 'DE per cell type, higher in WT') %>%
+  DT::formatSignif(columns = c('fdr'), digits = 3)
+
+readr::write_excel_csv2(x = hyper_res, file = file.path(config$out_root, '08_DE_NFATc1_per_tcell_type_mutant_vs_wildtype_enrich_higher_in_WT.csv'))
+```
+
+
+
+
+## GSEA for all T cells together
+
+```{r}
+filename <- '05_DE_edgeR_per_tcells_mutant_vs_wildtype.csv'
+de <- list()
+de$res <- readr::read_csv2(file = file.path(config$out_root, filename))
+de$res$split_level <- de$res$cell_type
+```
+
+## {.tabset}
+
+Enrichment analysis
+
+### DE genes higher in mutant
+```{r}
+# for the genes higher in mutant
+hyper_res <- group_by(de$res, split_level) %>%
+  mutate(is_de = FDR < 0.05 & logFC < 0) %>%
+  summarise(run_hyper(genes = gene[is_de], background = gene, pathways = genesets, min_size = 3)) %>% 
+  rename(cell_type = split_level, pathway = label, de_genes = signature) %>%
+  ungroup() %>%
+  mutate(fdr = p.adjust(pval, method = 'fdr')) %>%
+  #filter(fdr <= 0.1) %>%
+  arrange(fdr)
+
+select(hyper_res, cell_type, pathway, fdr, de_genes, geneset, overlap, hits) %>%
+  DT::datatable(rownames = FALSE, caption = 'DE per cell type, higher in mutant') %>%
+  DT::formatSignif(columns = c('fdr'), digits = 3)
+
+```
+
+### DE genes higher in WT
+```{r}
+# for the genes higher in mutant
+hyper_res <- group_by(de$res, split_level) %>%
+  mutate(is_de = FDR < 0.05 & logFC > 0) %>%
+  summarise(run_hyper(genes = gene[is_de], background = gene, pathways = genesets, min_size = 3)) %>% 
+  rename(cell_type = split_level, pathway = label, de_genes = signature) %>%
+  ungroup() %>%
+  mutate(fdr = p.adjust(pval, method = 'fdr')) %>%
+  #filter(fdr <= 0.1) %>% 
+  arrange(fdr)
+
+select(hyper_res, cell_type, pathway, fdr, de_genes, geneset, overlap, hits) %>%
+  DT::datatable(rownames = FALSE, caption = 'DE per cell type, higher in WT') %>%
+  DT::formatSignif(columns = c('fdr'), digits = 3)
+
+```
+
+
+
+# Runtime and session info
+
+Runtime: `r time_diff(start_time)`
+
+Session Info
+```{r}
+sessionInfo()
+```
